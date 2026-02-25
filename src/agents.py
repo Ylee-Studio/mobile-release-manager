@@ -42,8 +42,9 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
             "workflow state."
         ),
         backstory=(
-            "You are assigned to a single release version. You perform Jira and Slack "
-            "actions for this release and keep workflow state consistent and idempotent."
+            "You are assigned to a single release version. You perform Slack-driven "
+            "actions for this release, request manual Jira plan creation confirmation, "
+            "and keep workflow state consistent and idempotent."
         ),
         allow_delegation=False,
         verbose=True,
@@ -51,7 +52,17 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, and audit_reason. Use only the active release context and "
-            "incoming events. When tools return message_ts, persist it into "
+            "incoming events. Use `slack_approve` to request manual release confirmation "
+            "before moving to JIRA_RELEASE_CREATED. For every approval_confirmed event, "
+            "add a `slack_update` tool call that updates the original approval message, "
+            "removes buttons, and appends :white_check_mark: to its text. Then use "
+            "`slack_message` to notify the channel about manual Jira release creation "
+            "and release-fixation meeting. "
+            "When moving to WAIT_READINESS_CONFIRMATIONS, always include exactly one "
+            "`slack_message` tool call with a non-empty readiness text built from "
+            "config.readiness_owners (one :hourglass_flowing_sand: line per team). "
+            "If you cannot produce that message, do not move to WAIT_READINESS_CONFIRMATIONS. "
+            "When tools return message_ts, persist it into "
             "next_state.active_release.message_ts/thread_ts where applicable. "
             "Never duplicate side effects when state.completed_actions indicates "
             "an action already happened."

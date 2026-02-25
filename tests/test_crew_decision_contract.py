@@ -70,3 +70,53 @@ def test_decision_keeps_two_agent_contract_fields() -> None:
     assert decision.next_step == ReleaseStep.RELEASE_MANAGER_CREATED
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "3.1.0"
+
+
+def test_decision_accepts_active_release_aliases_from_agent() -> None:
+    payload = {
+        "next_step": "WAIT_START_APPROVAL",
+        "next_state": {
+            "active_release": {
+                "version": "5.104.0",
+                "status": "AWAITING_START_APPROVAL",
+                "channel_id": "C0AGLKF6KHD",
+            },
+            "processed_event_ids": [
+                "cmd-10580876139110.3996647710994.f0a39e21fa2165c809123d7e4b957bd7"
+            ],
+            "completed_actions": {},
+            "checkpoints": [],
+        },
+        "tool_calls": [{"tool": "slack_approve", "reason": "request approval"}],
+        "audit_reason": "manual_start_processed",
+    }
+
+    decision = CrewDecision.from_payload(payload, current_state=WorkflowState())
+    assert decision.next_step == ReleaseStep.WAIT_START_APPROVAL
+    assert decision.next_state.active_release is not None
+    assert decision.next_state.active_release.release_version == "5.104.0"
+    assert decision.next_state.active_release.step == ReleaseStep.WAIT_START_APPROVAL
+
+
+def test_decision_accepts_manual_release_confirmation_alias_from_agent() -> None:
+    payload = {
+        "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
+        "next_state": {
+            "active_release": {
+                "version": "5.104.0",
+                "status": "AWAITING_MANUAL_RELEASE_CONFIRMATION",
+                "channel_id": "C0AGLKF6KHD",
+            },
+            "processed_event_ids": ["ev-1"],
+            "completed_actions": {},
+            "checkpoints": [],
+        },
+        "tool_calls": [{"tool": "slack_approve", "reason": "request manual release confirmation"}],
+        "audit_reason": "manual_release_confirmation_requested",
+    }
+
+    decision = CrewDecision.from_payload(payload, current_state=WorkflowState())
+    assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.next_state.active_release is not None
+    assert decision.next_state.active_release.release_version == "5.104.0"
+    assert decision.next_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION

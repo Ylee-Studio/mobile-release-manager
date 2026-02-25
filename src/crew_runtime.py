@@ -13,7 +13,6 @@ from crewai.memory.long_term.long_term_memory import LTMSQLiteStorage, LongTermM
 from .agents import build_orchestrator_agent, build_release_manager_agent
 from .policies import PolicyConfig
 from .tasks import build_orchestrator_task, build_release_manager_task
-from .tools.jira_tools import CreateCrossspaceReleaseTool, JiraGateway
 from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, SlackMessageTool, SlackUpdateTool
 from .workflow_state import ReleaseStep, WorkflowState
 
@@ -80,7 +79,6 @@ class CrewRuntimeCoordinator:
         *,
         policy: PolicyConfig,
         slack_gateway: SlackGateway,
-        jira_gateway: JiraGateway,
         memory_db_path: str,
     ) -> None:
         self.policy = policy
@@ -90,7 +88,6 @@ class CrewRuntimeCoordinator:
             SlackApproveTool(gateway=slack_gateway),
             SlackUpdateTool(gateway=slack_gateway),
         ]
-        self.jira_tool = CreateCrossspaceReleaseTool(gateway=jira_gateway)
 
     def decide(
         self,
@@ -145,7 +142,6 @@ class CrewRuntimeCoordinator:
             )
             release_manager_task = build_release_manager_task(
                 agent=release_manager_agent,
-                jira_tool=self.jira_tool,
                 slack_tools=self.slack_tools,
             )
             release_manager_payload = self._run_crew(

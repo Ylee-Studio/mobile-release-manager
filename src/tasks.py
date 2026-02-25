@@ -21,7 +21,7 @@ def build_orchestrator_task(agent, slack_tools):
             "Required output JSON schema:\n"
             "{\n"
             '  "next_step": "IDLE|WAIT_START_APPROVAL|RELEASE_MANAGER_CREATED|'
-            'JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
+            'WAIT_MANUAL_RELEASE_CONFIRMATION|JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
             'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
             '  "tool_calls": [{"tool": "name", "reason": "why"}],\n'
@@ -40,12 +40,12 @@ def build_orchestrator_task(agent, slack_tools):
     )
 
 
-def build_release_manager_task(agent, jira_tool, slack_tools):
+def build_release_manager_task(agent, slack_tools):
     """Return release-manager task that executes release side effects."""
     return Task(
         description=(
             "You receive `state`, `events`, `config`, `now_iso` as inputs. "
-            "Use active release context only, execute Jira/Slack side effects for "
+            "Use active release context only, execute Slack side effects for "
             "that release, and return the updated workflow state."
             "\n"
             "Input context (authoritative):\n"
@@ -54,10 +54,26 @@ def build_release_manager_task(agent, jira_tool, slack_tools):
             "config={config}\n"
             "now_iso={now_iso}\n"
             "\n"
+            "Behavior requirements:\n"
+            "- Do NOT auto-create Jira releases.\n"
+            "- Move from RELEASE_MANAGER_CREATED to WAIT_MANUAL_RELEASE_CONFIRMATION and "
+            "request confirmation via slack_approve.\n"
+            "- After any approval_confirmed event, include slack_update for the trigger "
+            "message so buttons disappear and text ends with :white_check_mark:.\n"
+            "- After manual confirmation event, move to JIRA_RELEASE_CREATED and include "
+            "a slack_message tool call to notify the channel.\n"
+            "- When transitioning to WAIT_READINESS_CONFIRMATIONS, include exactly one "
+            "slack_message tool call with non-empty args.text that starts with "
+            "'Релиз <https://instories.atlassian.net/issues/?jql=' and includes "
+            "'Статус готовности к срезу:' and one ':hourglass_flowing_sand:' line per "
+            "team from config.readiness_owners.\n"
+            "- If next_step is WAIT_READINESS_CONFIRMATIONS and required readiness message "
+            "is missing, keep current step unchanged and return audit_reason explaining why.\n"
+            "\n"
             "Required output JSON schema:\n"
             "{\n"
             '  "next_step": "IDLE|WAIT_START_APPROVAL|RELEASE_MANAGER_CREATED|'
-            'JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
+            'WAIT_MANUAL_RELEASE_CONFIRMATION|JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
             'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
             '  "tool_calls": [{"tool": "name", "reason": "why"}],\n'
@@ -69,6 +85,6 @@ def build_release_manager_task(agent, jira_tool, slack_tools):
         expected_output=(
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason."
         ),
-        tools=[*slack_tools, jira_tool],
+        tools=[*slack_tools],
         agent=agent,
     )

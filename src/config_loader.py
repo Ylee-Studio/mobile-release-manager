@@ -15,9 +15,6 @@ CONFIG_PATH = PACKAGE_ROOT / "config.yaml"
 REQUIRED_ENV_VARS = [
     "OPENAI_API_KEY",
     "SLACK_BOT_TOKEN",
-    "JIRA_BASE_URL",
-    "JIRA_EMAIL",
-    "JIRA_API_TOKEN",
 ]
 
 
@@ -72,25 +69,6 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         raise RuntimeError("slack.channel_id must be set in config.yaml or env")
     if not bot_token:
         raise RuntimeError("slack.bot_token must be set in config.yaml or env")
-    jira_base_url = _resolve_env_value(
-        str(jira.get("base_url", "")),
-        fallback_env_var="JIRA_BASE_URL",
-    ).rstrip("/")
-    jira_email = _resolve_env_value(
-        str(jira.get("email", "")),
-        fallback_env_var="JIRA_EMAIL",
-    )
-    jira_api_token = _resolve_env_value(
-        str(jira.get("api_token", "")),
-        fallback_env_var="JIRA_API_TOKEN",
-    )
-    if not jira_base_url:
-        raise RuntimeError("jira.base_url must be set in config.yaml or env")
-    if not jira_email:
-        raise RuntimeError("jira.email must be set in config.yaml or env")
-    if not jira_api_token:
-        raise RuntimeError("jira.api_token must be set in config.yaml or env")
-
     return RuntimeConfig(
         slack_channel_id=channel_id,
         slack_bot_token=bot_token,
@@ -103,7 +81,4 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         audit_log_path=storage.get("audit_log_path", "artifacts/workflow_audit.jsonl"),
         slack_events_path=storage.get("slack_events_path", "artifacts/slack_events.jsonl"),
         agent_pid_path=storage.get("agent_pid_path", "artifacts/agent.pid"),
-        jira_base_url=jira_base_url,
-        jira_email=jira_email,
-        jira_api_token=jira_api_token,
     )

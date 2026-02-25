@@ -15,10 +15,36 @@ class ReleaseStep(str, Enum):
     IDLE = "IDLE"
     WAIT_START_APPROVAL = "WAIT_START_APPROVAL"
     RELEASE_MANAGER_CREATED = "RELEASE_MANAGER_CREATED"
+    WAIT_MANUAL_RELEASE_CONFIRMATION = "WAIT_MANUAL_RELEASE_CONFIRMATION"
     JIRA_RELEASE_CREATED = "JIRA_RELEASE_CREATED"
     WAIT_MEETING_CONFIRMATION = "WAIT_MEETING_CONFIRMATION"
     WAIT_READINESS_CONFIRMATIONS = "WAIT_READINESS_CONFIRMATIONS"
     READY_FOR_BRANCH_CUT = "READY_FOR_BRANCH_CUT"
+
+
+_STATUS_TO_STEP: dict[str, ReleaseStep] = {
+    "AWAITING_START_APPROVAL": ReleaseStep.WAIT_START_APPROVAL,
+    "WAITING_START_APPROVAL": ReleaseStep.WAIT_START_APPROVAL,
+    "RELEASE_MANAGER_ACTIVE": ReleaseStep.RELEASE_MANAGER_CREATED,
+    "AWAITING_MANUAL_RELEASE_CONFIRMATION": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+    "JIRA_RELEASE_READY": ReleaseStep.JIRA_RELEASE_CREATED,
+    "AWAITING_MEETING_CONFIRMATION": ReleaseStep.WAIT_MEETING_CONFIRMATION,
+    "AWAITING_READINESS_CONFIRMATIONS": ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+}
+
+
+def _coerce_step(value: Any, *, fallback: ReleaseStep) -> ReleaseStep:
+    if isinstance(value, ReleaseStep):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if not normalized:
+            return fallback
+        if normalized in ReleaseStep._value2member_map_:
+            return ReleaseStep(normalized)
+        if normalized in _STATUS_TO_STEP:
+            return _STATUS_TO_STEP[normalized]
+    return fallback
 
 
 @dataclass
@@ -78,16 +104,35 @@ class WorkflowState:
 
         active_raw = raw.get("active_release")
         active_release = None
-        if active_raw:
-            active_release = ReleaseContext(
-                release_version=active_raw["release_version"],
-                step=ReleaseStep(active_raw["step"]),
-                updated_at=active_raw.get("updated_at", utc_now_iso()),
-                slack_channel_id=active_raw.get("slack_channel_id"),
-                message_ts=dict(active_raw.get("message_ts", {})),
-                thread_ts=dict(active_raw.get("thread_ts", {})),
-                readiness_map=dict(active_raw.get("readiness_map", {})),
-            )
+        if isinstance(active_raw, dict):
+            release_version = str(
+                active_raw.get("release_version")
+                or active_raw.get("version")
+                or ""
+            ).strip()
+            if release_version:
+                step = _coerce_step(
+                    active_raw.get("step") or active_raw.get("status"),
+                    fallback=ReleaseStep.IDLE,
+                )
+                message_ts_raw = active_raw.get("message_ts", {})
+                thread_ts_raw = active_raw.get("thread_ts", {})
+                readiness_raw = active_raw.get("readiness_map", active_raw.get("readiness", {}))
+                channel_id = active_raw.get("slack_channel_id") or active_raw.get("channel_id")
+
+                message_ts = message_ts_raw if isinstance(message_ts_raw, dict) else {}
+                thread_ts = thread_ts_raw if isinstance(thread_ts_raw, dict) else {}
+                readiness_map = readiness_raw if isinstance(readiness_raw, dict) else {}
+
+                active_release = ReleaseContext(
+                    release_version=release_version,
+                    step=step,
+                    updated_at=active_raw.get("updated_at", utc_now_iso()),
+                    slack_channel_id=channel_id,
+                    message_ts=message_ts,
+                    thread_ts=thread_ts,
+                    readiness_map=readiness_map,
+                )
 
         return cls(
             active_release=active_release,

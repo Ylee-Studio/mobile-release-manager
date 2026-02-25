@@ -94,7 +94,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
         if event.get("type") != "message":
             self._send_json(200, {"ok": True, "ignored": True})
             return
-        if event.get("subtype") in {"bot_message", "message_changed", "message_deleted"}:
+        if _should_ignore_message_event(raw, event):
             self._send_json(200, {"ok": True, "ignored": True})
             return
 
@@ -130,6 +130,17 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
         thread_ts = container.get("thread_ts") or message.get("thread_ts") or message.get("ts")
         message_ts = container.get("message_ts") or message.get("ts")
         text = str(action.get("value") or (action.get("text") or {}).get("text") or "approve")
+        trigger_message_text = str(message.get("text") or "").strip()
+        if not trigger_message_text:
+            blocks = message.get("blocks")
+            if isinstance(blocks, list):
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    block_text = (block.get("text") or {}).get("text")
+                    if block_text:
+                        trigger_message_text = str(block_text).strip()
+                        break
 
         if not channel_id:
             self._send_json(200, {"ok": True, "ignored": True})
@@ -147,6 +158,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
                 "action_id": action.get("action_id"),
                 "block_id": action.get("block_id"),
                 "user_id": (payload.get("user") or {}).get("id"),
+                "trigger_message_text": trigger_message_text,
             },
         )
         self._trigger_event_processing()
@@ -261,6 +273,42 @@ def build_ingress_config(config: dict) -> SlackIngressConfig:
         announce_channel_id=channel_id,
         events_path=events_path,
     )
+
+
+def _extract_bot_user_id(raw_event: dict) -> str:
+    """Return bot user id from Slack Events envelope when available."""
+    authorizations = raw_event.get("authorizations")
+    if isinstance(authorizations, list):
+        for auth in authorizations:
+            if not isinstance(auth, dict):
+                continue
+            user_id = auth.get("user_id")
+            if user_id:
+                return str(user_id)
+
+    # Older Events API payloads may include authed_user/authed_users fields.
+    authed_user_id = raw_event.get("authed_user_id") or raw_event.get("authed_user")
+    if authed_user_id:
+        return str(authed_user_id)
+    authed_users = raw_event.get("authed_users")
+    if isinstance(authed_users, list) and authed_users:
+        first_user = authed_users[0]
+        if first_user:
+            return str(first_user)
+    return ""
+
+
+def _should_ignore_message_event(raw_event: dict, event: dict) -> bool:
+    subtype = event.get("subtype")
+    if subtype in {"bot_message", "message_changed", "message_deleted"}:
+        return True
+    if event.get("bot_id") or event.get("bot_profile"):
+        return True
+
+    bot_user_id = _extract_bot_user_id(raw_event)
+    if bot_user_id and str(event.get("user", "")) == bot_user_id:
+        return True
+    return False
 
 
 def run_slack_ingress(

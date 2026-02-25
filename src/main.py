@@ -16,7 +16,6 @@ from .crew_runtime import CrewRuntimeCoordinator
 from .policies import PolicyConfig
 from .release_workflow import ReleaseWorkflow
 from .slack_ingress import build_ingress_config, run_slack_ingress
-from .tools.jira_tools import JiraGateway
 from .tools.slack_tools import SlackGateway
 from .workflow_state import ReleaseStep
 
@@ -40,16 +39,10 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
         bot_token=runtime.slack_bot_token,
         events_path=Path(runtime.slack_events_path),
     )
-    jira_gateway = JiraGateway(
-        base_url=runtime.jira_base_url,
-        email=runtime.jira_email,
-        api_token=runtime.jira_api_token,
-    )
     memory = SQLiteMemory(db_path=runtime.memory_db_path)
     crew_runtime = CrewRuntimeCoordinator(
         policy=policy,
         slack_gateway=slack_gateway,
-        jira_gateway=jira_gateway,
         memory_db_path=runtime.memory_db_path,
     )
     workflow = ReleaseWorkflow(
