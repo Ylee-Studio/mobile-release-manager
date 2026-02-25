@@ -1,4 +1,4 @@
-"""CrewAI agent definitions for release train workflow."""
+"""CrewAI agent definitions for orchestrated release workflow."""
 from __future__ import annotations
 
 from crewai import Agent
@@ -7,38 +7,53 @@ from .policies import PolicyConfig
 
 
 def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
-    """Create the orchestration agent."""
+    """Create orchestrator agent responsible for release routing decisions."""
     return Agent(
-        role="Orchestrator",
-        goal="Start release trains at the right time and hand off to release managers.",
+        role="Release Orchestrator",
+        goal=(
+            "Control release-train state transitions and decide when to create or invoke "
+            "a release-specific manager."
+        ),
         backstory=(
-            "You coordinate release lifecycle boundaries. You can start from schedule "
-            "or manual Slack command, then initialize state and release manager context."
+            "You monitor heartbeat context and incoming events, determine the next "
+            "workflow step, and create Release Manager X.Y.Z when a release enters "
+            "execution phases."
         ),
         allow_delegation=False,
         verbose=True,
         max_interactions=policies.max_interactions,
         instructions=(
-            "Use heartbeat and Slack start signals. Never duplicate side effects. "
-            "Create one release manager per version and persist state transitions."
+            "Always return strict JSON with next_step, next_state OR state_patch, "
+            "tool_calls, audit_reason, and optional invoke_release_manager flag. "
+            "Set invoke_release_manager=true only when an active release exists and the "
+            "release manager must process release-specific side effects. Keep state "
+            "consistent with ReleaseStep enum and preserve idempotency via "
+            "state.processed_event_ids and state.completed_actions."
         ),
     )
 
 
 def build_release_manager_agent(policies: PolicyConfig, release_version: str) -> Agent:
-    """Create the release manager agent for a concrete version."""
+    """Create release-specific manager agent for active release version."""
     return Agent(
         role=f"Release Manager {release_version}",
-        goal=f"Drive release {release_version} to READY_FOR_BRANCH_CUT.",
+        goal=(
+            "Execute release actions for the active version and return an updated "
+            "workflow state."
+        ),
         backstory=(
-            "You run operational release steps in Slack and Jira, keeping one source "
-            "of truth in state storage and updating readiness in-place."
+            "You are assigned to a single release version. You perform Jira and Slack "
+            "actions for this release and keep workflow state consistent and idempotent."
         ),
         allow_delegation=False,
         verbose=True,
         max_interactions=policies.max_interactions,
         instructions=(
-            "Use Slack approve/message/update and Jira cross-space release. "
-            "Handle thread events directly, update readiness map, and stay idempotent."
+            "Always return strict JSON with next_step, next_state OR state_patch, "
+            "tool_calls, and audit_reason. Use only the active release context and "
+            "incoming events. When tools return message_ts, persist it into "
+            "next_state.active_release.message_ts/thread_ts where applicable. "
+            "Never duplicate side effects when state.completed_actions indicates "
+            "an action already happened."
         ),
     )

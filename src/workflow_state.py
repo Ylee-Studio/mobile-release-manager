@@ -51,31 +51,11 @@ class WorkflowState:
             return ReleaseStep.IDLE
         return self.active_release.step
 
-    def mark_event_processed(self, event_id: str) -> None:
-        if event_id in self.processed_event_ids:
-            return
-        self.processed_event_ids.append(event_id)
-        if len(self.processed_event_ids) > 1000:
-            self.processed_event_ids = self.processed_event_ids[-1000:]
-
     def is_action_done(self, action_key: str) -> bool:
         return action_key in self.completed_actions
 
     def mark_action_done(self, action_key: str) -> None:
         self.completed_actions[action_key] = utc_now_iso()
-
-    def add_checkpoint(self, *, phase: str, step: ReleaseStep, tool: str, release_version: str) -> None:
-        self.checkpoints.append(
-            {
-                "phase": phase,
-                "step": step.value,
-                "tool": tool,
-                "release_version": release_version,
-                "at": utc_now_iso(),
-            }
-        )
-        if len(self.checkpoints) > 200:
-            self.checkpoints = self.checkpoints[-200:]
 
     def to_dict(self) -> dict[str, Any]:
         active = None

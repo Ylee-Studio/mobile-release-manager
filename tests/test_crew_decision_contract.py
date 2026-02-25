@@ -1,0 +1,72 @@
+from src.crew_runtime import CrewDecision
+from src.workflow_state import ReleaseStep, WorkflowState
+
+
+def test_decision_accepts_full_next_state() -> None:
+    payload = {
+        "next_step": "WAIT_START_APPROVAL",
+        "next_state": {
+            "active_release": {
+                "release_version": "2.0.0",
+                "step": "WAIT_START_APPROVAL",
+                "message_ts": {},
+                "thread_ts": {},
+                "readiness_map": {"Growth": False},
+            },
+            "processed_event_ids": ["ev-123"],
+            "completed_actions": {},
+            "checkpoints": [],
+        },
+        "tool_calls": [{"tool": "slack_approve", "reason": "request approval"}],
+        "audit_reason": "new_release_started",
+    }
+    decision = CrewDecision.from_payload(payload, current_state=WorkflowState())
+    assert decision.next_step == ReleaseStep.WAIT_START_APPROVAL
+    assert decision.next_state.active_release is not None
+    assert decision.next_state.active_release.release_version == "2.0.0"
+    assert decision.tool_calls[0]["tool"] == "slack_approve"
+
+
+def test_decision_supports_state_patch_merge() -> None:
+    current = WorkflowState(
+        active_release=None,
+        previous_release_version="1.0.0",
+        processed_event_ids=["ev-1"],
+        completed_actions={},
+        checkpoints=[],
+    )
+    payload = {
+        "next_step": "IDLE",
+        "state_patch": {"processed_event_ids": ["ev-1", "ev-2"]},
+        "audit_reason": "mark_event_processed",
+    }
+    decision = CrewDecision.from_payload(payload, current_state=current)
+    assert decision.next_step == ReleaseStep.IDLE
+    assert decision.next_state.processed_event_ids == ["ev-1", "ev-2"]
+
+
+def test_decision_keeps_two_agent_contract_fields() -> None:
+    payload = {
+        "next_step": "RELEASE_MANAGER_CREATED",
+        "next_state": {
+            "active_release": {
+                "release_version": "3.1.0",
+                "step": "RELEASE_MANAGER_CREATED",
+                "message_ts": {},
+                "thread_ts": {},
+                "readiness_map": {"Core": False},
+            },
+            "processed_event_ids": [],
+            "completed_actions": {"start-approval:3.1.0": "done"},
+            "checkpoints": [],
+        },
+        "tool_calls": [{"tool": "slack_update", "reason": "prepare release manager phase"}],
+        "audit_reason": "orchestrator_ready_for_release_manager",
+        "invoke_release_manager": True,
+    }
+
+    decision = CrewDecision.from_payload(payload, current_state=WorkflowState(), actor="orchestrator")
+    assert decision.actor == "orchestrator"
+    assert decision.next_step == ReleaseStep.RELEASE_MANAGER_CREATED
+    assert decision.next_state.active_release is not None
+    assert decision.next_state.active_release.release_version == "3.1.0"

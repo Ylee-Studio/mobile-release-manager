@@ -7,6 +7,7 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -56,6 +57,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
 
     writer: SlackEventWriter
     cfg: SlackIngressConfig
+    on_event_persisted: Callable[[], None] | None = None
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         route = urlparse(self.path).path
@@ -106,6 +108,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
             message_ts=event.get("ts"),
             metadata={"source": "events_api"},
         )
+        self._trigger_event_processing()
         self._send_json(200, {"ok": True})
 
     def _handle_interactivity(self, body: bytes) -> None:
@@ -142,6 +145,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
                 "user_id": (payload.get("user") or {}).get("id"),
             },
         )
+        self._trigger_event_processing()
         self._send_json(200, {"ok": True})
 
     def _handle_commands(self, body: bytes) -> None:
@@ -175,6 +179,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
                 "user_id": form.get("user_id", [""])[0],
             },
         )
+        self._trigger_event_processing()
         self._send_json(
             200,
             {
@@ -182,6 +187,12 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
                 "text": "Запрос на старт релиза принят.",
             },
         )
+
+    def _trigger_event_processing(self) -> None:
+        callback = type(self).on_event_persisted
+        if not callback:
+            return
+        callback()
 
     def _verify_signature(self, body: bytes) -> bool:
         timestamp = self.headers.get("X-Slack-Request-Timestamp", "")
@@ -248,7 +259,13 @@ def build_ingress_config(config: dict) -> SlackIngressConfig:
     )
 
 
-def run_slack_ingress(*, host: str, port: int, cfg: SlackIngressConfig) -> None:
+def run_slack_ingress(
+    *,
+    host: str,
+    port: int,
+    cfg: SlackIngressConfig,
+    on_event_persisted: Callable[[], None] | None = None,
+) -> None:
     writer = SlackEventWriter(events_path=cfg.events_path)
 
     class _Handler(SlackRequestHandler):
@@ -256,6 +273,7 @@ def run_slack_ingress(*, host: str, port: int, cfg: SlackIngressConfig) -> None:
 
     _Handler.writer = writer
     _Handler.cfg = cfg
+    _Handler.on_event_persisted = on_event_persisted
 
     server = ThreadingHTTPServer((host, port), _Handler)
     server.serve_forever()

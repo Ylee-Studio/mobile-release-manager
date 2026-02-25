@@ -1,65 +1,62 @@
-"""CrewAI task definitions aligned with 001.001 workflow."""
+"""CrewAI task definitions for orchestrated runtime."""
 from __future__ import annotations
 
 from crewai import Task
 
 
-def build_release_workflow_tasks(orchestrator_agent, release_manager_agent, jira_tool, slack_tools):
-    """Return task templates used by orchestrator and release manager."""
-    start_release_train = Task(
+def build_orchestrator_task(agent, slack_tools):
+    """Return orchestrator task that controls workflow routing."""
+    return Task(
         description=(
-            "Start release train from heartbeat schedule or manual Slack request."
-            " Prepare start approval in channel and persist WAIT_START_APPROVAL."
+            "You receive `state`, `events`, `config`, `now_iso` as inputs. "
+            "Read workflow context, choose next release step, and decide whether "
+            "Release Manager must be invoked for release-specific actions."
+            "\n"
+            "Required output JSON schema:\n"
+            "{\n"
+            '  "next_step": "IDLE|WAIT_START_APPROVAL|RELEASE_MANAGER_CREATED|'
+            'JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
+            'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
+            '  "next_state": { ... WorkflowState dict ... },\n'
+            '  "tool_calls": [{"tool": "name", "reason": "why"}],\n'
+            '  "audit_reason": "short explanation",\n'
+            '  "invoke_release_manager": true|false\n'
+            "}\n"
+            "Set invoke_release_manager=true only when active release exists and "
+            "release manager should continue execution. "
+            "Use `next_state` as the complete state snapshot for persistence."
         ),
         expected_output=(
-            "One start-approval message exists, release version is set, and state is persisted."
+            "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager."
         ),
-        tools=slack_tools,
-        agent=orchestrator_agent,
+        tools=[*slack_tools],
+        agent=agent,
     )
 
-    confirm_or_update_version = Task(
+
+def build_release_manager_task(agent, jira_tool, slack_tools):
+    """Return release-manager task that executes release side effects."""
+    return Task(
         description=(
-            "Track replies in start approval thread: accept alternative X.Y.Z if provided,"
-            " then continue once approval is confirmed."
+            "You receive `state`, `events`, `config`, `now_iso` as inputs. "
+            "Use active release context only, execute Jira/Slack side effects for "
+            "that release, and return the updated workflow state."
+            "\n"
+            "Required output JSON schema:\n"
+            "{\n"
+            '  "next_step": "IDLE|WAIT_START_APPROVAL|RELEASE_MANAGER_CREATED|'
+            'JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
+            'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
+            '  "next_state": { ... WorkflowState dict ... },\n'
+            '  "tool_calls": [{"tool": "name", "reason": "why"}],\n'
+            '  "audit_reason": "short explanation"\n'
+            "}\n"
+            "Use `next_state` as the complete state snapshot for persistence. "
+            "If no change is needed, return the same state with matching next_step."
         ),
-        expected_output="Final approved version and transition to RELEASE_MANAGER_CREATED.",
-        tools=slack_tools,
-        agent=release_manager_agent,
-    )
-
-    create_crossspace_release = Task(
-        description=(
-            "Create Jira cross-space release for approved X.Y.Z with configured projects."
+        expected_output=(
+            "Valid JSON object with next_step, next_state, tool_calls, audit_reason."
         ),
-        expected_output="Jira cross-space release exists and state moved to JIRA_RELEASE_CREATED.",
-        tools=[jira_tool],
-        agent=release_manager_agent,
+        tools=[*slack_tools, jira_tool],
+        agent=agent,
     )
-
-    announce_kickoff_meeting = Task(
-        description=(
-            "Post kickoff message with JQL link, request meeting confirmation,"
-            " and transition to WAIT_MEETING_CONFIRMATION."
-        ),
-        expected_output="Meeting confirmation request posted via slack_approve.",
-        tools=slack_tools,
-        agent=release_manager_agent,
-    )
-
-    collect_readiness_statuses = Task(
-        description=(
-            "Post one readiness status message and update it incrementally by thread confirmations."
-        ),
-        expected_output="All readiness owners marked :white_check_mark: and state READY_FOR_BRANCH_CUT.",
-        tools=slack_tools,
-        agent=release_manager_agent,
-    )
-
-    return [
-        start_release_train,
-        confirm_or_update_version,
-        create_crossspace_release,
-        announce_kickoff_meeting,
-        collect_readiness_statuses,
-    ]

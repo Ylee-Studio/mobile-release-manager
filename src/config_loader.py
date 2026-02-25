@@ -53,7 +53,6 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
     storage = workflow.get("storage", {})
     slack = config.get("slack", {})
     jira = config.get("jira", {})
-    retry = config.get("retry", {})
 
     readiness_owners = {
         str(team): str(owner)
@@ -93,14 +92,13 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         heartbeat_idle_minutes=int(heartbeat.get("idle_minutes", 240)),
         jira_project_keys=[str(v) for v in jira.get("project_keys", [])],
         readiness_owners=readiness_owners,
-        release_state_path=storage.get("state_path", "artifacts/workflow_state.json"),
+        memory_db_path=storage.get("memory_db_path", "artifacts/crewai_memory.db"),
+        audit_log_path=storage.get("audit_log_path", "artifacts/workflow_audit.jsonl"),
         slack_outbox_path=storage.get("slack_outbox_path", "artifacts/mock_slack_outbox.jsonl"),
         slack_events_path=storage.get("slack_events_path", "artifacts/mock_slack_events.jsonl"),
         jira_outbox_path=storage.get("jira_outbox_path", "artifacts/mock_jira_outbox.jsonl"),
+        agent_pid_path=storage.get("agent_pid_path", "artifacts/agent.pid"),
         jira_base_url=jira_base_url,
         jira_email=jira_email,
         jira_api_token=jira_api_token,
-        retry_max_attempts=int(retry.get("max_attempts", 3)),
-        retry_base_delay_seconds=float(retry.get("base_delay_seconds", 0.5)),
-        retry_max_delay_seconds=float(retry.get("max_delay_seconds", 2.0)),
     )
