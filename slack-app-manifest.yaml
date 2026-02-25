@@ -1,0 +1,36 @@
+_metadata:
+  major_version: 1
+  minor_version: 1
+display_information:
+  name: Release Manager Bot
+  description: Automation bot for release train coordination
+  background_color: "#1F2937"
+features:
+  bot_user:
+    display_name: Release Manager
+    always_online: false
+  slash_commands:
+    - command: /release-start
+      url: https://unrepudiative-alena-succinctly.ngrok-free.dev/slack/commands
+      description: Start release train flow manually
+      usage_hint: "[version optional]"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - channels:history
+      - groups:history
+      - commands
+settings:
+  event_subscriptions:
+    request_url: https://unrepudiative-alena-succinctly.ngrok-free.dev/slack/events
+    bot_events:
+      - message.channels
+      - message.groups
+  interactivity:
+    is_enabled: true
+    request_url: https://unrepudiative-alena-succinctly.ngrok-free.dev/slack/interactivity
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

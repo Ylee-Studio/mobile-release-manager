@@ -1,0 +1,261 @@
+"""Minimal Slack HTTP ingress that writes workflow events to jsonl."""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+
+@dataclass
+class SlackIngressConfig:
+    signing_secret: str
+    announce_channel_id: str
+    events_path: Path
+
+
+class SlackEventWriter:
+    """Persists Slack events in workflow-compatible jsonl format."""
+
+    def __init__(self, events_path: Path):
+        self.events_path = events_path
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        channel_id: str,
+        text: str = "",
+        thread_ts: str | None = None,
+        message_ts: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        payload = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "channel_id": channel_id,
+            "text": text,
+            "thread_ts": thread_ts,
+            "message_ts": message_ts,
+            "metadata": metadata or {},
+        }
+        with self.events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+class SlackRequestHandler(BaseHTTPRequestHandler):
+    """Accepts Slack events, interactivity and commands."""
+
+    writer: SlackEventWriter
+    cfg: SlackIngressConfig
+
+    def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        route = urlparse(self.path).path
+        body = self._read_body()
+        if not self._verify_signature(body):
+            self._send_json(401, {"ok": False, "error": "invalid_signature"})
+            return
+
+        if route == "/slack/events":
+            self._handle_events(body)
+            return
+        if route == "/slack/interactivity":
+            self._handle_interactivity(body)
+            return
+        if route == "/slack/commands":
+            self._handle_commands(body)
+            return
+        self._send_json(404, {"ok": False, "error": "not_found"})
+
+    def _handle_events(self, body: bytes) -> None:
+        raw = json.loads(body.decode("utf-8"))
+        if raw.get("type") == "url_verification":
+            self._send_json(200, {"challenge": raw.get("challenge", "")})
+            return
+        if raw.get("type") != "event_callback":
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+
+        event = raw.get("event", {})
+        if event.get("type") != "message":
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+        if event.get("subtype") in {"bot_message", "message_changed", "message_deleted"}:
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+
+        channel_id = str(event.get("channel", ""))
+        if not channel_id:
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+
+        self.writer.write(
+            event_id=str(raw.get("event_id") or f"evt-{uuid.uuid4()}"),
+            event_type="message",
+            channel_id=channel_id,
+            text=str(event.get("text", "")),
+            thread_ts=event.get("thread_ts") or event.get("ts"),
+            message_ts=event.get("ts"),
+            metadata={"source": "events_api"},
+        )
+        self._send_json(200, {"ok": True})
+
+    def _handle_interactivity(self, body: bytes) -> None:
+        form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        payload_raw = form.get("payload", ["{}"])[0]
+        payload = json.loads(payload_raw)
+        if payload.get("type") != "block_actions":
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+
+        action = (payload.get("actions") or [{}])[0]
+        channel_id = str((payload.get("channel") or {}).get("id", ""))
+        message = payload.get("message") or {}
+        container = payload.get("container") or {}
+        thread_ts = container.get("thread_ts") or message.get("thread_ts") or message.get("ts")
+        message_ts = container.get("message_ts") or message.get("ts")
+        text = str(action.get("value") or (action.get("text") or {}).get("text") or "approve")
+
+        if not channel_id:
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+
+        self.writer.write(
+            event_id=f"action-{payload.get('trigger_id') or uuid.uuid4()}",
+            event_type="approval_confirmed",
+            channel_id=channel_id,
+            text=text,
+            thread_ts=thread_ts,
+            message_ts=message_ts,
+            metadata={
+                "source": "interactivity",
+                "action_id": action.get("action_id"),
+                "block_id": action.get("block_id"),
+                "user_id": (payload.get("user") or {}).get("id"),
+            },
+        )
+        self._send_json(200, {"ok": True})
+
+    def _handle_commands(self, body: bytes) -> None:
+        form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        command = form.get("command", [""])[0]
+        channel_id = form.get("channel_id", [""])[0]
+        text = form.get("text", [""])[0]
+        if command != "/release-start":
+            self._send_json(200, {"ok": True, "ignored": True})
+            return
+        if not channel_id:
+            self._send_json(200, {"ok": False, "error": "missing_channel"})
+            return
+        if channel_id != self.cfg.announce_channel_id:
+            self._send_json(
+                200,
+                {
+                    "response_type": "ephemeral",
+                    "text": "Эта команда доступна только в релизном канале.",
+                },
+            )
+            return
+
+        self.writer.write(
+            event_id=f"cmd-{form.get('trigger_id', [''])[0] or uuid.uuid4()}",
+            event_type="manual_start",
+            channel_id=channel_id,
+            text=text,
+            metadata={
+                "source": "slash_command",
+                "user_id": form.get("user_id", [""])[0],
+            },
+        )
+        self._send_json(
+            200,
+            {
+                "response_type": "ephemeral",
+                "text": "Запрос на старт релиза принят.",
+            },
+        )
+
+    def _verify_signature(self, body: bytes) -> bool:
+        timestamp = self.headers.get("X-Slack-Request-Timestamp", "")
+        signature = self.headers.get("X-Slack-Signature", "")
+        if not timestamp or not signature:
+            return False
+        try:
+            ts = int(timestamp)
+        except ValueError:
+            return False
+        if abs(int(time.time()) - ts) > 60 * 5:
+            return False
+
+        base = f"v0:{timestamp}:{body.decode('utf-8')}"
+        digest = hmac.new(
+            self.cfg.signing_secret.encode("utf-8"),
+            base.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        expected = f"v0={digest}"
+        return hmac.compare_digest(expected, signature)
+
+    def _read_body(self) -> bytes:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(content_length)
+
+    def _send_json(self, code: int, payload: dict) -> None:
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        # Keep default HTTP noise out of CLI output.
+        return
+
+
+def build_ingress_config(config: dict) -> SlackIngressConfig:
+    workflow = config.get("workflow", {})
+    storage = workflow.get("storage", {})
+    slack = config.get("slack", {})
+
+    raw_channel = str(slack.get("channel_id", ""))
+    if raw_channel.startswith("${") and raw_channel.endswith("}"):
+        channel_id = os.getenv(raw_channel[2:-1], "")
+    else:
+        channel_id = raw_channel
+    if not channel_id:
+        channel_id = os.getenv("SLACK_ANNOUNCE_CHANNEL", "")
+    if not channel_id:
+        raise RuntimeError("SLACK_ANNOUNCE_CHANNEL must be set for Slack ingress.")
+
+    signing_secret = os.getenv("SLACK_SIGNING_SECRET", "")
+    if not signing_secret:
+        raise RuntimeError("SLACK_SIGNING_SECRET must be set for Slack ingress.")
+
+    events_path = Path(storage.get("slack_events_path", "artifacts/mock_slack_events.jsonl"))
+    return SlackIngressConfig(
+        signing_secret=signing_secret,
+        announce_channel_id=channel_id,
+        events_path=events_path,
+    )
+
+
+def run_slack_ingress(*, host: str, port: int, cfg: SlackIngressConfig) -> None:
+    writer = SlackEventWriter(events_path=cfg.events_path)
+
+    class _Handler(SlackRequestHandler):
+        pass
+
+    _Handler.writer = writer
+    _Handler.cfg = cfg
+
+    server = ThreadingHTTPServer((host, port), _Handler)
+    server.serve_forever()

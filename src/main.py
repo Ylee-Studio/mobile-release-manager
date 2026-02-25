@@ -10,6 +10,7 @@ from rich.console import Console
 
 from .config_loader import ensure_env_vars, load_config, load_runtime_config
 from .release_workflow import ReleaseWorkflow
+from .slack_ingress import build_ingress_config, run_slack_ingress
 from .state_store import StateStore
 from .tools.jira_tools import JiraGateway
 from .tools.slack_tools import SlackGateway
@@ -76,6 +77,21 @@ def run_heartbeat(iterations: int = typer.Option(0, help="0 means infinite loop.
 
         delay_minutes = idle_minutes if state.step == ReleaseStep.IDLE else active_minutes
         time.sleep(delay_minutes * 60)
+
+
+@app.command("run-slack-webhook")
+def run_slack_webhook(
+    host: str = typer.Option("0.0.0.0", help="Host for webhook HTTP server."),
+    port: int = typer.Option(8080, help="Port for webhook HTTP server."),
+) -> None:
+    """Run minimal Slack webhook ingress server."""
+    _configure_logging()
+    cfg = build_ingress_config(load_config())
+    console.print(
+        f"[cyan]Slack ingress listening on http://{host}:{port} "
+        f"(events file: {cfg.events_path})[/]"
+    )
+    run_slack_ingress(host=host, port=port, cfg=cfg)
 
 
 if __name__ == "__main__":
