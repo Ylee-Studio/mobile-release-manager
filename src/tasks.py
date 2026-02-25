@@ -1,43 +1,65 @@
-"""CrewAI tasks for the Release Manager crew."""
+"""CrewAI task definitions aligned with 001.001 workflow."""
 from __future__ import annotations
 
 from crewai import Task
 
 
-def build_tasks(agent, notion_tool):
-    """Return the ordered list of tasks for the release run."""
-    readiness = Task(
+def build_release_workflow_tasks(orchestrator_agent, release_manager_agent, jira_tool, slack_tools):
+    """Return task templates used by orchestrator and release manager."""
+    start_release_train = Task(
         description=(
-            "Pull the latest release checklist from Notion, summarize each step,"
-            " and highlight any items that are not yet complete."
+            "Start release train from heartbeat schedule or manual Slack request."
+            " Prepare start approval in channel and persist WAIT_START_APPROVAL."
         ),
         expected_output=(
-            "A markdown table with columns: step, owner, status, due date, blockers."
-            " Include a final paragraph listing the top 3 risks."
+            "One start-approval message exists, release version is set, and state is persisted."
         ),
-        tools=[notion_tool],
-        agent=agent,
+        tools=slack_tools,
+        agent=orchestrator_agent,
     )
 
-    blockers = Task(
+    confirm_or_update_version = Task(
         description=(
-            "For every blocker surfaced, craft next actions with owners and deadlines."
-            " Escalate anything older than 24h."
+            "Track replies in start approval thread: accept alternative X.Y.Z if provided,"
+            " then continue once approval is confirmed."
         ),
-        expected_output="Bullet list of blockers with owner, ETA, and escalation status.",
-        tools=[notion_tool],
-        agent=agent,
+        expected_output="Final approved version and transition to RELEASE_MANAGER_CREATED.",
+        tools=slack_tools,
+        agent=release_manager_agent,
     )
 
-    comms = Task(
+    create_crossspace_release = Task(
         description=(
-            "Draft a Slack-ready release update that references readiness status"
-            " and calls out blockers. Keep it under 150 words."
+            "Create Jira cross-space release for approved X.Y.Z with configured projects."
         ),
-        expected_output=(
-            "A Slack message with title, summary, blockers section, and next checkpoint time."
-        ),
-        agent=agent,
+        expected_output="Jira cross-space release exists and state moved to JIRA_RELEASE_CREATED.",
+        tools=[jira_tool],
+        agent=release_manager_agent,
     )
 
-    return [readiness, blockers, comms]
+    announce_kickoff_meeting = Task(
+        description=(
+            "Post kickoff message with JQL link, request meeting confirmation,"
+            " and transition to WAIT_MEETING_CONFIRMATION."
+        ),
+        expected_output="Meeting confirmation request posted via slack_approve.",
+        tools=slack_tools,
+        agent=release_manager_agent,
+    )
+
+    collect_readiness_statuses = Task(
+        description=(
+            "Post one readiness status message and update it incrementally by thread confirmations."
+        ),
+        expected_output="All readiness owners marked :white_check_mark: and state READY_FOR_BRANCH_CUT.",
+        tools=slack_tools,
+        agent=release_manager_agent,
+    )
+
+    return [
+        start_release_train,
+        confirm_or_update_version,
+        create_crossspace_release,
+        announce_kickoff_meeting,
+        collect_readiness_statuses,
+    ]

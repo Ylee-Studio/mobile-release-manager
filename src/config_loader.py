@@ -1,27 +1,21 @@
-"""Configuration helpers for the Release Manager crew."""
+"""Configuration helpers for release workflow runtime."""
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import yaml
+
+from .release_workflow import RuntimeConfig
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PACKAGE_ROOT / "config.yaml"
 
 REQUIRED_ENV_VARS = [
     "OPENAI_API_KEY",
-    "NOTION_API_KEY",
-    "NOTION_RELEASE_DATABASE_ID",
     "SLACK_BOT_TOKEN",
-    "SLACK_SIGNING_SECRET",
-    "SLACK_ANNOUNCE_CHANNEL",
     "JIRA_API_TOKEN",
-    "JIRA_BASE_URL",
-    "JIRA_PROJECT_KEY",
-    "JIRA_EMAIL",
 ]
 
 
@@ -42,13 +36,38 @@ def ensure_env_vars(vars_to_check: Iterable[str] | None = None) -> None:
         )
 
 
-def load_tool_config(config: dict) -> dict:
-    notion_cfg = config.get("tools", {}).get("notion_release", {})
-    env_var = notion_cfg.get("database_id_env", "NOTION_RELEASE_DATABASE_ID")
-    database_id = os.getenv(env_var)
-    if not database_id:
-        raise RuntimeError(f"Environment variable {env_var} must be set for Notion access")
-    return {
-        "release_doc_url": notion_cfg.get("release_doc_url", "https://www.notion.so"),
-        "database_id": database_id,
+def load_runtime_config(config: dict) -> RuntimeConfig:
+    workflow = config.get("workflow", {})
+    heartbeat = workflow.get("heartbeat", {})
+    storage = workflow.get("storage", {})
+    slack = config.get("slack", {})
+    jira = config.get("jira", {})
+    retry = config.get("retry", {})
+
+    readiness_owners = {
+        str(team): str(owner)
+        for team, owner in workflow.get("readiness_owners", {}).items()
     }
+    channel_id = str(slack.get("channel_id", os.getenv("SLACK_ANNOUNCE_CHANNEL", "")))
+    if channel_id.startswith("${") and channel_id.endswith("}"):
+        channel_id = os.getenv(channel_id[2:-1], "")
+    if not readiness_owners:
+        raise RuntimeError("workflow.readiness_owners must be configured in config.yaml")
+    if not channel_id:
+        raise RuntimeError("slack.channel_id must be set in config.yaml or env")
+
+    return RuntimeConfig(
+        slack_channel_id=channel_id,
+        timezone=workflow.get("timezone", "Europe/Moscow"),
+        heartbeat_active_minutes=int(heartbeat.get("active_minutes", 15)),
+        heartbeat_idle_minutes=int(heartbeat.get("idle_minutes", 240)),
+        jira_project_keys=[str(v) for v in jira.get("project_keys", [])],
+        readiness_owners=readiness_owners,
+        release_state_path=storage.get("state_path", "artifacts/workflow_state.json"),
+        slack_outbox_path=storage.get("slack_outbox_path", "artifacts/mock_slack_outbox.jsonl"),
+        slack_events_path=storage.get("slack_events_path", "artifacts/mock_slack_events.jsonl"),
+        jira_outbox_path=storage.get("jira_outbox_path", "artifacts/mock_jira_outbox.jsonl"),
+        retry_max_attempts=int(retry.get("max_attempts", 3)),
+        retry_base_delay_seconds=float(retry.get("base_delay_seconds", 0.5)),
+        retry_max_delay_seconds=float(retry.get("max_delay_seconds", 2.0)),
+    )

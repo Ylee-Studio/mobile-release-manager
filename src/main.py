@@ -1,74 +1,76 @@
-"""CLI entrypoint for the Release Manager crew."""
+"""CLI entrypoint for release train orchestrator."""
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 
 import typer
-from crewai import Crew, Process
 from rich.console import Console
 
-from .agents import build_release_coordinator
-from .config_loader import ensure_env_vars, load_config, load_tool_config
-from .policies import PolicyConfig
-from .tasks import build_tasks
-from .tools.notion_tool import NotionReleaseTool
+from .config_loader import ensure_env_vars, load_config, load_runtime_config
+from .release_workflow import ReleaseWorkflow
+from .state_store import StateStore
+from .tools.jira_tools import JiraGateway
+from .tools.slack_tools import SlackGateway
+from .workflow_state import ReleaseStep
 
-app = typer.Typer(help="Coordinate the software release checklist with CrewAI.")
+app = typer.Typer(help="Coordinate release train workflow up to READY_FOR_BRANCH_CUT.")
 console = Console()
 
 
-@app.command()
-def run(
-    override_quiet_hours: bool = typer.Option(
-        False, help="Override quiet hours policy for urgent releases."
-    ),
-    approved_by: str | None = typer.Option(
-        None,
-        help="Name/email of the human approver authorizing release communications.",
-    ),
-):
-    """Kick off the crew after verifying guardrails."""
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def _build_workflow() -> tuple[ReleaseWorkflow, int, int]:
     ensure_env_vars()
     config = load_config()
-    policies = PolicyConfig.from_dict(
-        config.get("policies", {}),
-        default_max_interactions=config.get("agent", {}).get("max_interactions", 4),
+    runtime = load_runtime_config(config)
+    state_store = StateStore(path=Path(runtime.release_state_path))
+    slack_gateway = SlackGateway(
+        outbox_path=Path(runtime.slack_outbox_path),
+        events_path=Path(runtime.slack_events_path),
     )
-
-    if not override_quiet_hours and policies.quiet_hours.is_quiet_now():
-        console.print(
-            "[yellow]Quiet hours are in effect. Rerun with --override-quiet-hours for emergencies."
-        )
-        raise typer.Exit(code=1)
-
-    policies.approvals.validate(approved_by)
-    if approved_by:
-        console.print(f"[green]Approval granted by {approved_by}.")
-
-    notion_cfg = load_tool_config(config)
-    notion_tool = NotionReleaseTool(
-        release_doc_url=notion_cfg["release_doc_url"],
-        database_id=notion_cfg["database_id"],
+    jira_gateway = JiraGateway(outbox_path=Path(runtime.jira_outbox_path))
+    workflow = ReleaseWorkflow(
+        config=runtime,
+        state_store=state_store,
+        slack_gateway=slack_gateway,
+        jira_gateway=jira_gateway,
     )
+    return workflow, runtime.heartbeat_active_minutes, runtime.heartbeat_idle_minutes
 
-    agent = build_release_coordinator(policies)
-    tasks = build_tasks(agent, notion_tool)
 
-    crew = Crew(
-        agents=[agent],
-        tasks=tasks,
-        process=Process.sequential,
-    )
+@app.command()
+def tick() -> None:
+    """Execute one heartbeat tick."""
+    _configure_logging()
+    workflow, _active, _idle = _build_workflow()
+    state = workflow.tick()
+    console.print(f"[green]Tick complete.[/] Current step: {state.step.value}")
 
-    console.print("[cyan]Starting release readiness run...\n")
-    result = crew.kickoff()
-    artifacts_dir = Path("artifacts")
-    artifacts_dir.mkdir(exist_ok=True)
-    output_path = artifacts_dir / "release-summary.md"
-    output_path.write_text(str(result), encoding="utf-8")
-    console.print(
-        f"[bold green]Run complete.[/] Summary saved to {output_path.resolve()}"
-    )
+
+@app.command("run-heartbeat")
+def run_heartbeat(iterations: int = typer.Option(0, help="0 means infinite loop.")) -> None:
+    """Run the heartbeat loop."""
+    _configure_logging()
+    workflow, active_minutes, idle_minutes = _build_workflow()
+
+    run_count = 0
+    while True:
+        state = workflow.tick()
+        run_count += 1
+        console.print(f"[cyan]Heartbeat tick #{run_count} step={state.step.value}")
+
+        if iterations and run_count >= iterations:
+            break
+
+        delay_minutes = idle_minutes if state.step == ReleaseStep.IDLE else active_minutes
+        time.sleep(delay_minutes * 60)
 
 
 if __name__ == "__main__":

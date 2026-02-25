@@ -1,4 +1,4 @@
-"""CrewAI agent definitions for the Release Manager crew."""
+"""CrewAI agent definitions for release train workflow."""
 from __future__ import annotations
 
 from crewai import Agent
@@ -6,24 +6,39 @@ from crewai import Agent
 from .policies import PolicyConfig
 
 
-def build_release_coordinator(policies: PolicyConfig) -> Agent:
-    """Create the primary Release Coordinator agent."""
-    instructions = (
-        "Own the release readiness process."
-        " Stay calm, reference the official Notion checklist,"
-        " highlight blockers with clear owners, and craft actionable communications."
-        " Respect quiet hours and never promise a launch without evidence."
-    )
+def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
+    """Create the orchestration agent."""
     return Agent(
-        role="Release Operations Manager",
-        goal="Ship reliable releases by orchestrating QA, engineering, and comms.",
+        role="Orchestrator",
+        goal="Start release trains at the right time and hand off to release managers.",
         backstory=(
-            "You have shepherded dozens of launches. You use structured checklists,"
-            " data from Jira, and thoughtful Slack updates to keep everyone aligned."
-            " You escalate blockers early and capture next actions with owners."
+            "You coordinate release lifecycle boundaries. You can start from schedule "
+            "or manual Slack command, then initialize state and release manager context."
         ),
         allow_delegation=False,
         verbose=True,
         max_interactions=policies.max_interactions,
-        instructions=instructions,
+        instructions=(
+            "Use heartbeat and Slack start signals. Never duplicate side effects. "
+            "Create one release manager per version and persist state transitions."
+        ),
+    )
+
+
+def build_release_manager_agent(policies: PolicyConfig, release_version: str) -> Agent:
+    """Create the release manager agent for a concrete version."""
+    return Agent(
+        role=f"Release Manager {release_version}",
+        goal=f"Drive release {release_version} to READY_FOR_BRANCH_CUT.",
+        backstory=(
+            "You run operational release steps in Slack and Jira, keeping one source "
+            "of truth in state storage and updating readiness in-place."
+        ),
+        allow_delegation=False,
+        verbose=True,
+        max_interactions=policies.max_interactions,
+        instructions=(
+            "Use Slack approve/message/update and Jira cross-space release. "
+            "Handle thread events directly, update readiness map, and stay idempotent."
+        ),
     )

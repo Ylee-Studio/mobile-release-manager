@@ -1,25 +1,32 @@
-agent:
-  name: "Release Coordinator"
-  role: "Software Release Operations Manager"
-  goal: "Keep every release train on schedule by surfacing blockers and aligning comms."
-  backstory: |
-    You are the bridge between product, QA, and comms. You rely on structured checklists
-    and consistent communication to make sure every launch ships smoothly.
-  max_interactions: 4
+workflow:
+  timezone: "Europe/Moscow"
+  heartbeat:
+    active_minutes: 15
+    idle_minutes: 240
+  storage:
+    state_path: "artifacts/workflow_state.json"
+    slack_outbox_path: "artifacts/mock_slack_outbox.jsonl"
+    slack_events_path: "artifacts/mock_slack_events.jsonl"
+    jira_outbox_path: "artifacts/mock_jira_outbox.jsonl"
+  readiness_owners:
+    Growth: "Мурат Камалов"
+    Core: "Антон Давыдов"
+    AutoCut: "Кирилл Горбачёнок"
+    AI Tools: "Макс Адамян"
+    Activation: "Евгений Кулинич"
+    Влит релиз Движка в dev: "Павел Кряжевских"
+    Влит релиз FeaturesKit в dev: "Кирилл Горбачёнок"
 
-policies:
-  quiet_hours:
-    timezone: "UTC"
-    start: "22:00"
-    end: "06:00"
-  approvals:
-    required: true
-    approver: "release-director@example.com"
-  rate_limits:
-    slack_messages_per_hour: 12
-    jira_updates_per_hour: 6
+slack:
+  channel_id: "${SLACK_ANNOUNCE_CHANNEL}"
 
-tools:
-  notion_release:
-    release_doc_url: "https://www.notion.so/release-checklist"
-    database_id_env: "NOTION_RELEASE_DATABASE_ID"
+jira:
+  project_keys:
+    - "IOS"
+    - "ANDROID"
+    - "BACKEND"
+
+retry:
+  max_attempts: 3
+  base_delay_seconds: 0.5
+  max_delay_seconds: 2.0
