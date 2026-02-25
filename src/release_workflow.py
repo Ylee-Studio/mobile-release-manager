@@ -17,6 +17,7 @@ from .workflow_state import WorkflowState
 @dataclass
 class RuntimeConfig:
     slack_channel_id: str
+    slack_bot_token: str
     timezone: str
     heartbeat_active_minutes: int
     heartbeat_idle_minutes: int
@@ -24,9 +25,7 @@ class RuntimeConfig:
     readiness_owners: dict[str, str]
     memory_db_path: str
     audit_log_path: str
-    slack_outbox_path: str
     slack_events_path: str
-    jira_outbox_path: str
     agent_pid_path: str
     jira_base_url: str | None = None
     jira_email: str | None = None
@@ -83,11 +82,13 @@ class ReleaseWorkflow:
         next_state: WorkflowState,
         events: list[dict[str, Any]],
     ) -> None:
+        incoming_slack_messages = _extract_event_messages(events)
         payload = {
             "trace_id": trace_id,
             "actor": decision.actor,
             "event_count": len(events),
             "events": events,
+            "incoming_slack_messages": incoming_slack_messages,
             "previous_step": previous_state.step.value,
             "next_step": decision.next_step.value,
             "tool_calls": decision.tool_calls,
@@ -99,11 +100,12 @@ class ReleaseWorkflow:
         with self.audit_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
         self.logger.info(
-            "trace_id=%s decision next_step=%s reason=%s events=%s",
+            "trace_id=%s decision next_step=%s reason=%s events=%s incoming_slack_messages=%s",
             trace_id,
             decision.next_step.value,
             decision.audit_reason,
             len(events),
+            incoming_slack_messages,
         )
 
 
@@ -117,3 +119,21 @@ def _event_to_dict(event: Any) -> dict[str, Any]:
         "message_ts": getattr(event, "message_ts", None),
         "metadata": getattr(event, "metadata", None),
     }
+
+
+def _extract_event_messages(events: list[dict[str, Any]]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for event in events:
+        event_id = str(event.get("event_id", ""))
+        event_type = str(event.get("event_type", ""))
+        text = str(event.get("text", ""))
+        if not text:
+            continue
+        messages.append(
+            {
+                "event_id": event_id,
+                "event_type": event_type,
+                "text": text,
+            }
+        )
+    return messages

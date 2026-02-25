@@ -6,9 +6,7 @@ workflow:
   storage:
     memory_db_path: "artifacts/crewai_memory.db"
     audit_log_path: "artifacts/workflow_audit.jsonl"
-    slack_outbox_path: "artifacts/mock_slack_outbox.jsonl"
-    slack_events_path: "artifacts/mock_slack_events.jsonl"
-    jira_outbox_path: "artifacts/mock_jira_outbox.jsonl"
+    slack_events_path: "artifacts/slack_events.jsonl"
   readiness_owners:
     Growth: "Мурат Камалов"
     Core: "Антон Давыдов"
@@ -20,6 +18,7 @@ workflow:
 
 slack:
   channel_id: "${SLACK_ANNOUNCE_CHANNEL}"
+  bot_token: "${SLACK_BOT_TOKEN}"
 
 jira:
   project_keys:

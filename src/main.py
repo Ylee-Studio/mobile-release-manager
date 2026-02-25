@@ -37,11 +37,10 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
     runtime = load_runtime_config(config)
     policy = PolicyConfig.from_dict(config.get("policies", {}))
     slack_gateway = SlackGateway(
-        outbox_path=Path(runtime.slack_outbox_path),
+        bot_token=runtime.slack_bot_token,
         events_path=Path(runtime.slack_events_path),
     )
     jira_gateway = JiraGateway(
-        outbox_path=Path(runtime.jira_outbox_path),
         base_url=runtime.jira_base_url,
         email=runtime.jira_email,
         api_token=runtime.jira_api_token,

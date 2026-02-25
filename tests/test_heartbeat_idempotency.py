@@ -4,7 +4,6 @@ from pathlib import Path
 from src.crew_memory import SQLiteMemory
 from src.crew_runtime import CrewDecision
 from src.release_workflow import ReleaseWorkflow, RuntimeConfig
-from src.tools.jira_tools import JiraGateway
 from src.tools.slack_tools import SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
@@ -44,15 +43,27 @@ class FakeCrewRuntime:
         )
 
 
+class RecordingCrewRuntime:
+    def __init__(self) -> None:
+        self.seen_event_ids: list[list[str]] = []
+
+    def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
+        self.seen_event_ids.append([event.event_id for event in events])
+        return CrewDecision(
+            next_step=state.step,
+            next_state=state,
+            audit_reason="recorded",
+        )
+
+
 def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
     memory_db = tmp_path / "crewai_memory.db"
     audit_log = tmp_path / "workflow_audit.jsonl"
-    slack_outbox = tmp_path / "slack_outbox.jsonl"
     slack_events = tmp_path / "slack_events.jsonl"
-    jira_outbox = tmp_path / "jira_outbox.jsonl"
 
     config = RuntimeConfig(
         slack_channel_id="C_RELEASE",
+        slack_bot_token="xoxb-test-token",
         timezone="Europe/Moscow",
         heartbeat_active_minutes=15,
         heartbeat_idle_minutes=240,
@@ -60,14 +71,14 @@ def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
         readiness_owners={"Growth": "owner"},
         memory_db_path=str(memory_db),
         audit_log_path=str(audit_log),
-        slack_outbox_path=str(slack_outbox),
         slack_events_path=str(slack_events),
-        jira_outbox_path=str(jira_outbox),
         agent_pid_path=str(tmp_path / "agent.pid"),
+        jira_base_url="https://jira.example.com",
+        jira_email="bot@example.com",
+        jira_api_token="token",
     )
     memory = SQLiteMemory(db_path=str(memory_db))
-    slack_gateway = SlackGateway(outbox_path=slack_outbox, events_path=slack_events)
-    _jira_gateway = JiraGateway(outbox_path=jira_outbox)
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
 
     workflow = ReleaseWorkflow(config=config, memory=memory, slack_gateway=slack_gateway, crew_runtime=FakeCrewRuntime())
 
@@ -98,3 +109,58 @@ def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
     audit_rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert audit_rows
     assert "actor" in audit_rows[-1]
+
+
+def test_fifo_events_consumed_one_per_tick(tmp_path: Path) -> None:
+    memory_db = tmp_path / "crewai_memory.db"
+    audit_log = tmp_path / "workflow_audit.jsonl"
+    slack_events = tmp_path / "slack_events.jsonl"
+
+    config = RuntimeConfig(
+        slack_channel_id="C_RELEASE",
+        slack_bot_token="xoxb-test-token",
+        timezone="Europe/Moscow",
+        heartbeat_active_minutes=15,
+        heartbeat_idle_minutes=240,
+        jira_project_keys=["IOS"],
+        readiness_owners={"Growth": "owner"},
+        memory_db_path=str(memory_db),
+        audit_log_path=str(audit_log),
+        slack_events_path=str(slack_events),
+        agent_pid_path=str(tmp_path / "agent.pid"),
+        jira_base_url="https://jira.example.com",
+        jira_email="bot@example.com",
+        jira_api_token="token",
+    )
+    memory = SQLiteMemory(db_path=str(memory_db))
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
+    runtime = RecordingCrewRuntime()
+    workflow = ReleaseWorkflow(config=config, memory=memory, slack_gateway=slack_gateway, crew_runtime=runtime)
+
+    _append_event(
+        slack_events,
+        {
+            "event_id": "ev-1",
+            "event_type": "manual_start",
+            "channel_id": "C_RELEASE",
+            "text": "start release",
+        },
+    )
+    _append_event(
+        slack_events,
+        {
+            "event_id": "ev-2",
+            "event_type": "approval_confirmed",
+            "channel_id": "C_RELEASE",
+            "text": "approve",
+        },
+    )
+
+    workflow.tick()
+    queue_after_first_tick = slack_events.read_text(encoding="utf-8").splitlines()
+    workflow.tick()
+    queue_after_second_tick = slack_events.read_text(encoding="utf-8").splitlines()
+
+    assert runtime.seen_event_ids == [["ev-1"], ["ev-2"]]
+    assert len(queue_after_first_tick) == 1
+    assert queue_after_second_tick == []

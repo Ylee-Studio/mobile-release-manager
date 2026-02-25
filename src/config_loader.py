@@ -62,10 +62,16 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         str(slack.get("channel_id", "")),
         fallback_env_var="SLACK_ANNOUNCE_CHANNEL",
     )
+    bot_token = _resolve_env_value(
+        str(slack.get("bot_token", "")),
+        fallback_env_var="SLACK_BOT_TOKEN",
+    )
     if not readiness_owners:
         raise RuntimeError("workflow.readiness_owners must be configured in config.yaml")
     if not channel_id:
         raise RuntimeError("slack.channel_id must be set in config.yaml or env")
+    if not bot_token:
+        raise RuntimeError("slack.bot_token must be set in config.yaml or env")
     jira_base_url = _resolve_env_value(
         str(jira.get("base_url", "")),
         fallback_env_var="JIRA_BASE_URL",
@@ -87,6 +93,7 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
 
     return RuntimeConfig(
         slack_channel_id=channel_id,
+        slack_bot_token=bot_token,
         timezone=workflow.get("timezone", "Europe/Moscow"),
         heartbeat_active_minutes=int(heartbeat.get("active_minutes", 15)),
         heartbeat_idle_minutes=int(heartbeat.get("idle_minutes", 240)),
@@ -94,9 +101,7 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         readiness_owners=readiness_owners,
         memory_db_path=storage.get("memory_db_path", "artifacts/crewai_memory.db"),
         audit_log_path=storage.get("audit_log_path", "artifacts/workflow_audit.jsonl"),
-        slack_outbox_path=storage.get("slack_outbox_path", "artifacts/mock_slack_outbox.jsonl"),
-        slack_events_path=storage.get("slack_events_path", "artifacts/mock_slack_events.jsonl"),
-        jira_outbox_path=storage.get("jira_outbox_path", "artifacts/mock_jira_outbox.jsonl"),
+        slack_events_path=storage.get("slack_events_path", "artifacts/slack_events.jsonl"),
         agent_pid_path=storage.get("agent_pid_path", "artifacts/agent.pid"),
         jira_base_url=jira_base_url,
         jira_email=jira_email,

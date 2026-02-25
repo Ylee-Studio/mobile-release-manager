@@ -7,6 +7,7 @@ import json
 import os
 import time
 import uuid
+import fcntl
 from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,7 +50,10 @@ class SlackEventWriter:
             "metadata": metadata or {},
         }
         with self.events_path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 class SlackRequestHandler(BaseHTTPRequestHandler):

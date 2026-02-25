@@ -5,3 +5,4 @@ artifacts/
 .venv
 **/*.egg-info/
 uv.lock
+.pytest_cache/

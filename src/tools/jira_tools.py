@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import json
-from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -14,44 +13,25 @@ from pydantic import BaseModel, Field
 
 
 class JiraGateway:
-    """Gateway used by workflow and tests.
-
-    If Jira credentials are provided, performs real Jira API calls.
-    Otherwise falls back to local outbox mock mode.
-    """
+    """Gateway used by workflow and tests."""
 
     def __init__(
         self,
         *,
-        outbox_path: Path | None = None,
         base_url: str | None = None,
         email: str | None = None,
         api_token: str | None = None,
         timeout_seconds: float = 15.0,
     ):
-        self.outbox_path = outbox_path
         self.base_url = (base_url or "").rstrip("/")
         self.email = email or ""
         self.api_token = api_token or ""
         self.timeout_seconds = timeout_seconds
-        self._use_real_api = all([self.base_url, self.email, self.api_token])
-
-        if self.outbox_path:
-            self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.base_url or not self.email or not self.api_token:
+            raise RuntimeError("Jira credentials are missing for JiraGateway.")
 
     def create_crossspace_release(self, version: str, project_keys: list[str]) -> dict[str, Any]:
-        if self._use_real_api:
-            return self._create_crossspace_release_real(version=version, project_keys=project_keys)
-        if not self.outbox_path:
-            raise RuntimeError("Jira outbox path is not configured for mock mode.")
-        payload = {
-            "op": "create_crossspace_release",
-            "version": version,
-            "project_keys": project_keys,
-        }
-        with self.outbox_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        return {"version": version, "project_keys": project_keys, "status": "created"}
+        return self._create_crossspace_release_real(version=version, project_keys=project_keys)
 
     def _create_crossspace_release_real(self, *, version: str, project_keys: list[str]) -> dict[str, Any]:
         created_project_keys: list[str] = []
