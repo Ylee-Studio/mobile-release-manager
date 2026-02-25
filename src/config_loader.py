@@ -15,6 +15,8 @@ CONFIG_PATH = PACKAGE_ROOT / "config.yaml"
 REQUIRED_ENV_VARS = [
     "OPENAI_API_KEY",
     "SLACK_BOT_TOKEN",
+    "JIRA_BASE_URL",
+    "JIRA_EMAIL",
     "JIRA_API_TOKEN",
 ]
 
@@ -36,6 +38,15 @@ def ensure_env_vars(vars_to_check: Iterable[str] | None = None) -> None:
         )
 
 
+def _resolve_env_value(raw_value: str, *, fallback_env_var: str) -> str:
+    value = raw_value
+    if value.startswith("${") and value.endswith("}"):
+        value = os.getenv(value[2:-1], "")
+    if not value:
+        value = os.getenv(fallback_env_var, "")
+    return value
+
+
 def load_runtime_config(config: dict) -> RuntimeConfig:
     workflow = config.get("workflow", {})
     heartbeat = workflow.get("heartbeat", {})
@@ -48,13 +59,32 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         str(team): str(owner)
         for team, owner in workflow.get("readiness_owners", {}).items()
     }
-    channel_id = str(slack.get("channel_id", os.getenv("SLACK_ANNOUNCE_CHANNEL", "")))
-    if channel_id.startswith("${") and channel_id.endswith("}"):
-        channel_id = os.getenv(channel_id[2:-1], "")
+    channel_id = _resolve_env_value(
+        str(slack.get("channel_id", "")),
+        fallback_env_var="SLACK_ANNOUNCE_CHANNEL",
+    )
     if not readiness_owners:
         raise RuntimeError("workflow.readiness_owners must be configured in config.yaml")
     if not channel_id:
         raise RuntimeError("slack.channel_id must be set in config.yaml or env")
+    jira_base_url = _resolve_env_value(
+        str(jira.get("base_url", "")),
+        fallback_env_var="JIRA_BASE_URL",
+    ).rstrip("/")
+    jira_email = _resolve_env_value(
+        str(jira.get("email", "")),
+        fallback_env_var="JIRA_EMAIL",
+    )
+    jira_api_token = _resolve_env_value(
+        str(jira.get("api_token", "")),
+        fallback_env_var="JIRA_API_TOKEN",
+    )
+    if not jira_base_url:
+        raise RuntimeError("jira.base_url must be set in config.yaml or env")
+    if not jira_email:
+        raise RuntimeError("jira.email must be set in config.yaml or env")
+    if not jira_api_token:
+        raise RuntimeError("jira.api_token must be set in config.yaml or env")
 
     return RuntimeConfig(
         slack_channel_id=channel_id,
@@ -67,6 +97,9 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         slack_outbox_path=storage.get("slack_outbox_path", "artifacts/mock_slack_outbox.jsonl"),
         slack_events_path=storage.get("slack_events_path", "artifacts/mock_slack_events.jsonl"),
         jira_outbox_path=storage.get("jira_outbox_path", "artifacts/mock_jira_outbox.jsonl"),
+        jira_base_url=jira_base_url,
+        jira_email=jira_email,
+        jira_api_token=jira_api_token,
         retry_max_attempts=int(retry.get("max_attempts", 3)),
         retry_base_delay_seconds=float(retry.get("base_delay_seconds", 0.5)),
         retry_max_delay_seconds=float(retry.get("max_delay_seconds", 2.0)),

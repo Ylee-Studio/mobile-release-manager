@@ -47,6 +47,9 @@ class RuntimeConfig:
     slack_outbox_path: str
     slack_events_path: str
     jira_outbox_path: str
+    jira_base_url: str | None = None
+    jira_email: str | None = None
+    jira_api_token: str | None = None
     retry_max_attempts: int = 3
     retry_base_delay_seconds: float = 0.5
     retry_max_delay_seconds: float = 2.0

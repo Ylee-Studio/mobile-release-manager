@@ -35,7 +35,12 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int]:
         outbox_path=Path(runtime.slack_outbox_path),
         events_path=Path(runtime.slack_events_path),
     )
-    jira_gateway = JiraGateway(outbox_path=Path(runtime.jira_outbox_path))
+    jira_gateway = JiraGateway(
+        outbox_path=Path(runtime.jira_outbox_path),
+        base_url=runtime.jira_base_url,
+        email=runtime.jira_email,
+        api_token=runtime.jira_api_token,
+    )
     workflow = ReleaseWorkflow(
         config=runtime,
         state_store=state_store,
