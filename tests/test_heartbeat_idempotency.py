@@ -1,8 +1,7 @@
 import json
-import sqlite3
 from pathlib import Path
 
-from src.crew_memory import SQLiteMemory
+from src.crew_memory import CrewAIMemory
 from src.crew_runtime import CrewDecision
 from src.release_workflow import MANUAL_RELEASE_MESSAGE, ReleaseWorkflow, RuntimeConfig
 from src.tools.slack_tools import SlackGateway
@@ -223,7 +222,7 @@ def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
         slack_events_path=str(slack_events),
         agent_pid_path=str(tmp_path / "agent.pid"),
     )
-    memory = SQLiteMemory(db_path=str(memory_db))
+    memory = CrewAIMemory(db_path=str(memory_db))
     slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
 
     workflow = ReleaseWorkflow(config=config, memory=memory, slack_gateway=slack_gateway, crew_runtime=FakeCrewRuntime())
@@ -241,7 +240,7 @@ def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
 
     restarted_workflow = ReleaseWorkflow(
         config=config,
-        memory=SQLiteMemory(db_path=str(memory_db)),
+        memory=CrewAIMemory(db_path=str(memory_db)),
         slack_gateway=slack_gateway,
         crew_runtime=FakeCrewRuntime(),
     )
@@ -275,7 +274,7 @@ def test_fifo_events_consumed_one_per_tick(tmp_path: Path) -> None:
         slack_events_path=str(slack_events),
         agent_pid_path=str(tmp_path / "agent.pid"),
     )
-    memory = SQLiteMemory(db_path=str(memory_db))
+    memory = CrewAIMemory(db_path=str(memory_db))
     slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
     runtime = RecordingCrewRuntime()
     workflow = ReleaseWorkflow(config=config, memory=memory, slack_gateway=slack_gateway, crew_runtime=runtime)
@@ -332,7 +331,7 @@ def test_runtime_executes_slack_approve_tool_call(tmp_path: Path, monkeypatch) -
         slack_events_path=str(slack_events),
         agent_pid_path=str(tmp_path / "agent.pid"),
     )
-    memory = SQLiteMemory(db_path=str(memory_db))
+    memory = CrewAIMemory(db_path=str(memory_db))
     slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
     monkeypatch.setattr(slack_gateway, "send_approve", _fake_send_approve)
     workflow = ReleaseWorkflow(
@@ -395,7 +394,7 @@ def test_runtime_executes_manual_release_confirmation_flow(tmp_path: Path, monke
         slack_events_path=str(slack_events),
         agent_pid_path=str(tmp_path / "agent.pid"),
     )
-    memory = SQLiteMemory(db_path=str(memory_db))
+    memory = CrewAIMemory(db_path=str(memory_db))
     slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
     monkeypatch.setattr(slack_gateway, "send_approve", _fake_send_approve)
     monkeypatch.setattr(slack_gateway, "send_message", _fake_send_message)
@@ -483,7 +482,7 @@ def test_runtime_failfast_on_slack_message_without_args_text(tmp_path: Path, mon
         slack_events_path=str(slack_events),
         agent_pid_path=str(tmp_path / "agent.pid"),
     )
-    memory = SQLiteMemory(db_path=str(memory_db))
+    memory = CrewAIMemory(db_path=str(memory_db))
     slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
     monkeypatch.setattr(slack_gateway, "send_message", _fake_send_message)
     workflow = ReleaseWorkflow(
@@ -584,9 +583,9 @@ def test_workflow_loads_state_only_once_per_process(tmp_path: Path) -> None:
     assert memory.load_count == 1
 
 
-def test_sqlite_memory_keeps_latest_snapshot_per_release_and_last_two_releases(tmp_path: Path) -> None:
+def test_crewai_memory_keeps_latest_snapshot_per_release_and_last_two_releases(tmp_path: Path) -> None:
     memory_db = tmp_path / "crewai_memory.db"
-    memory = SQLiteMemory(db_path=str(memory_db))
+    memory = CrewAIMemory(db_path=str(memory_db))
 
     release_100 = _state_with_release("1.0.0")
     memory.save_state(release_100, reason="first")
@@ -601,16 +600,14 @@ def test_sqlite_memory_keeps_latest_snapshot_per_release_and_last_two_releases(t
     release_120 = _state_with_release("1.2.0", previous="1.1.0")
     memory.save_state(release_120, reason="third")
 
-    with sqlite3.connect(memory_db) as connection:
-        rows = connection.execute(
-            "SELECT snapshot_key, state_json FROM workflow_state_snapshots ORDER BY snapshot_key"
-        ).fetchall()
-
-    keys = [row[0] for row in rows]
+    keys = memory.snapshot_keys()
     assert keys == ["1.1.0", "1.2.0"]
-    parsed = {row[0]: json.loads(row[1]) for row in rows}
-    assert parsed["1.2.0"]["active_release"]["release_version"] == "1.2.0"
-    assert parsed["1.1.0"]["active_release"]["release_version"] == "1.1.0"
+    release_120_state = memory.snapshot_state("1.2.0")
+    release_110_state = memory.snapshot_state("1.1.0")
+    assert release_120_state is not None
+    assert release_110_state is not None
+    assert release_120_state["active_release"]["release_version"] == "1.2.0"
+    assert release_110_state["active_release"]["release_version"] == "1.1.0"
 
 
 def test_manual_transition_prunes_future_actions_and_replays_start_approval(tmp_path: Path, monkeypatch) -> None:
@@ -653,7 +650,7 @@ def test_manual_transition_prunes_future_actions_and_replays_start_approval(tmp_
         return {"message_ts": "1772140000.123456"}
 
     config = _runtime_config(tmp_path)
-    memory = SQLiteMemory(db_path=config.memory_db_path)
+    memory = CrewAIMemory(db_path=config.memory_db_path)
     stale_state = WorkflowState(
         active_release=None,
         previous_release_version="5.104.0",
@@ -723,7 +720,7 @@ def test_non_user_transition_does_not_prune_completed_actions(tmp_path: Path) ->
             )
 
     config = _runtime_config(tmp_path)
-    memory = SQLiteMemory(db_path=config.memory_db_path)
+    memory = CrewAIMemory(db_path=config.memory_db_path)
     seeded_state = WorkflowState(
         active_release=ReleaseContext(
             release_version="5.104.0",

@@ -7,9 +7,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from .crew_memory import SQLiteMemory
+from .crew_memory import CrewAIMemory
 from .crew_runtime import CrewDecision, CrewRuntimeCoordinator
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
 from .tools.slack_tools import (
@@ -39,6 +39,11 @@ class RuntimeConfig:
     agent_pid_path: str
 
 
+class WorkflowMemory(Protocol):
+    def load_state(self) -> WorkflowState: ...
+    def save_state(self, state: WorkflowState, *, reason: str) -> None: ...
+
+
 class ReleaseWorkflow:
     """Thin runtime that delegates release decisions to Crew."""
 
@@ -46,9 +51,9 @@ class ReleaseWorkflow:
         self,
         *,
         config: RuntimeConfig,
-        memory: SQLiteMemory,
+        memory: WorkflowMemory | CrewAIMemory,
         slack_gateway: SlackGateway,
-        crew_runtime: CrewRuntimeCoordinator,
+        crew_runtime: CrewRuntimeCoordinator | Any,
     ):
         self.config = config
         self.memory = memory
@@ -71,11 +76,11 @@ class ReleaseWorkflow:
         queue_remaining = self.slack_gateway.pending_events_count()
         trace_id = str(uuid.uuid4())
 
-        decision = self.crew_runtime.decide(
+        decision = self._run_runtime_decision(
             state=state,
             events=events,
-            config=self.config,
             now=now,
+            trigger_reason=trigger_reason,
         )
         try:
             decision.tool_calls = validate_and_normalize_tool_calls(
@@ -119,6 +124,47 @@ class ReleaseWorkflow:
             queue_remaining,
         )
         return next_state
+
+    def _run_runtime_decision(
+        self,
+        *,
+        state: WorkflowState,
+        events: list[Any],
+        now: datetime | None,
+        trigger_reason: str,
+    ) -> CrewDecision:
+        kickoff = getattr(self.crew_runtime, "kickoff", None)
+        if callable(kickoff):
+            try:
+                return kickoff(
+                    state=state,
+                    events=events,
+                    config=self.config,
+                    now=now,
+                    trigger_reason=trigger_reason,
+                )
+            except TypeError:
+                return kickoff(
+                    state=state,
+                    events=events,
+                    config=self.config,
+                    now=now,
+                )
+        try:
+            return self.crew_runtime.decide(
+                state=state,
+                events=events,
+                config=self.config,
+                now=now,
+                trigger_reason=trigger_reason,
+            )
+        except TypeError:
+            return self.crew_runtime.decide(
+                state=state,
+                events=events,
+                config=self.config,
+                now=now,
+            )
 
     def _append_audit(
         self,

@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from crewai import Task
 
+from .runtime_contracts import AgentDecisionPayload
+
 
 def build_orchestrator_task(agent, slack_tools):
     """Return orchestrator task that controls workflow routing."""
     return Task(
         description=(
-            "You receive `state`, `events`, `config`, `now_iso` as inputs. "
+            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason`, `memory_context` as inputs. "
             "Read workflow context, choose next release step, and decide whether "
             "Release Manager must be invoked for release-specific actions."
             "\n"
@@ -17,6 +19,8 @@ def build_orchestrator_task(agent, slack_tools):
             "events={events}\n"
             "config={config}\n"
             "now_iso={now_iso}\n"
+            "trigger_reason={trigger_reason}\n"
+            "memory_context={memory_context}\n"
             "\n"
             "Required output JSON schema:\n"
             "{\n"
@@ -41,6 +45,7 @@ def build_orchestrator_task(agent, slack_tools):
         expected_output=(
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager."
         ),
+        output_pydantic=AgentDecisionPayload,
         tools=[*slack_tools],
         agent=agent,
     )
@@ -50,7 +55,7 @@ def build_release_manager_task(agent, slack_tools):
     """Return release-manager task that executes release side effects."""
     return Task(
         description=(
-            "You receive `state`, `events`, `config`, `now_iso` as inputs. "
+            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason`, `memory_context` as inputs. "
             "Use active release context only, execute Slack side effects for "
             "that release, and return the updated workflow state."
             "\n"
@@ -59,6 +64,8 @@ def build_release_manager_task(agent, slack_tools):
             "events={events}\n"
             "config={config}\n"
             "now_iso={now_iso}\n"
+            "trigger_reason={trigger_reason}\n"
+            "memory_context={memory_context}\n"
             "\n"
             "Behavior requirements:\n"
             "- Do NOT auto-create Jira releases.\n"
@@ -94,6 +101,7 @@ def build_release_manager_task(agent, slack_tools):
         expected_output=(
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason."
         ),
+        output_pydantic=AgentDecisionPayload,
         tools=[*slack_tools],
         agent=agent,
     )

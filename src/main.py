@@ -11,7 +11,7 @@ import typer
 from rich.console import Console
 
 from .config_loader import ensure_env_vars, load_config, load_runtime_config
-from .crew_memory import SQLiteMemory
+from .crew_memory import CrewAIMemory
 from .crew_runtime import CrewRuntimeCoordinator
 from .policies import PolicyConfig
 from .release_workflow import ReleaseWorkflow
@@ -40,7 +40,7 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
         bot_token=runtime.slack_bot_token,
         events_path=Path(runtime.slack_events_path),
     )
-    memory = SQLiteMemory(db_path=runtime.memory_db_path)
+    memory = CrewAIMemory(db_path=runtime.memory_db_path)
     crew_runtime = CrewRuntimeCoordinator(
         policy=policy,
         slack_gateway=slack_gateway,

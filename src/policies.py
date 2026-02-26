@@ -47,6 +47,9 @@ class RateLimitPolicy:
 @dataclass
 class PolicyConfig:
     max_interactions: int
+    max_iterations: int
+    max_execution_time_seconds: int | None
+    agent_verbose: bool
     quiet_hours: QuietHoursPolicy
     approvals: ApprovalPolicy
     rate_limits: RateLimitPolicy
@@ -58,6 +61,9 @@ class PolicyConfig:
         rate_cfg = raw.get("rate_limits", {})
         return cls(
             max_interactions=raw.get("max_interactions", default_max_interactions),
+            max_iterations=raw.get("max_iterations", raw.get("max_interactions", default_max_interactions)),
+            max_execution_time_seconds=raw.get("max_execution_time_seconds"),
+            agent_verbose=raw.get("agent_verbose", True),
             quiet_hours=QuietHoursPolicy(
                 timezone=quiet_cfg.get("timezone", "UTC"),
                 start=quiet_cfg.get("start", "22:00"),

@@ -20,8 +20,10 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
             "execution phases."
         ),
         allow_delegation=False,
-        verbose=True,
+        verbose=policies.agent_verbose,
         max_interactions=policies.max_interactions,
+        max_iter=policies.max_iterations,
+        max_execution_time=policies.max_execution_time_seconds,
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, audit_reason, and optional invoke_release_manager flag. "
@@ -51,8 +53,10 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
             "and keep workflow state consistent and idempotent."
         ),
         allow_delegation=False,
-        verbose=True,
+        verbose=policies.agent_verbose,
         max_interactions=policies.max_interactions,
+        max_iter=policies.max_iterations,
+        max_execution_time=policies.max_execution_time_seconds,
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, and audit_reason. Use only the active release context and "
