@@ -281,5 +281,3 @@ class CrewAIMemory:
             return None
         return WorkflowState.from_dict(raw_state)
 
-
-SQLiteMemory = CrewAIMemory

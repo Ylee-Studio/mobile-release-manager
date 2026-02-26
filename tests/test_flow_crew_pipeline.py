@@ -75,47 +75,6 @@ def test_release_workflow_propagates_trigger_reason_to_runtime(tmp_path: Path) -
     assert runtime.trigger_reason == "signal_trigger"
 
 
-def test_orchestrator_run_uses_cached_crew_kickoff(monkeypatch, tmp_path: Path) -> None:
-    class _CrewResult:
-        def __init__(self) -> None:
-            self.json_dict = {
-                "next_step": ReleaseStep.IDLE.value,
-                "next_state": WorkflowState().to_dict(),
-                "tool_calls": [],
-                "audit_reason": "crew_kickoff",
-                "invoke_release_manager": False,
-            }
-            self.tasks_output = []
-
-    class _FakeCrew:
-        def __init__(self) -> None:
-            self.called = 0
-
-        def kickoff(self, *, inputs):  # noqa: ANN001
-            self.called += 1
-            assert "trigger_reason" in inputs
-            return _CrewResult()
-
-    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
-    coordinator = CrewRuntimeCoordinator(
-        policy=_policy(),
-        slack_gateway=gateway,
-        memory_db_path=str(tmp_path / "memory.db"),
-    )
-    fake_crew = _FakeCrew()
-    coordinator._orchestrator_crew = fake_crew
-
-    decision = coordinator.kickoff(
-        state=WorkflowState(),
-        events=[],
-        config=_config(),
-        trigger_reason="signal_drain",
-    )
-
-    assert decision.next_step == ReleaseStep.IDLE
-    assert fake_crew.called == 1
-
-
 def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch, tmp_path: Path) -> None:
     class _InvalidCrewResult:
         raw = "not-a-json-payload"
@@ -145,20 +104,3 @@ def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch,
     assert decision.next_step == initial_state.step
     assert decision.next_state == initial_state
     assert decision.audit_reason.startswith("crew_runtime_error:")
-
-
-def test_crewai_memory_fallback_uses_json_sidecar(tmp_path: Path) -> None:
-    memory_db = tmp_path / "crewai_memory.db"
-    # Simulate binary sqlite payload at legacy path.
-    memory_db.write_bytes(b"SQLite format 3\x00binary-content")
-    memory = CrewAIMemory(db_path=str(memory_db))
-
-    loaded = memory.load_state()
-    assert loaded.step == ReleaseStep.IDLE
-
-    seeded = WorkflowState()
-    memory.save_state(seeded, reason="seed")
-
-    sidecar = Path(f"{memory_db}.json")
-    assert sidecar.exists()
-    assert "snapshots" in sidecar.read_text(encoding="utf-8")

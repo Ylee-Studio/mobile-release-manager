@@ -133,38 +133,13 @@ class ReleaseWorkflow:
         now: datetime | None,
         trigger_reason: str,
     ) -> CrewDecision:
-        kickoff = getattr(self.crew_runtime, "kickoff", None)
-        if callable(kickoff):
-            try:
-                return kickoff(
-                    state=state,
-                    events=events,
-                    config=self.config,
-                    now=now,
-                    trigger_reason=trigger_reason,
-                )
-            except TypeError:
-                return kickoff(
-                    state=state,
-                    events=events,
-                    config=self.config,
-                    now=now,
-                )
-        try:
-            return self.crew_runtime.decide(
-                state=state,
-                events=events,
-                config=self.config,
-                now=now,
-                trigger_reason=trigger_reason,
-            )
-        except TypeError:
-            return self.crew_runtime.decide(
-                state=state,
-                events=events,
-                config=self.config,
-                now=now,
-            )
+        return self.crew_runtime.kickoff(
+            state=state,
+            events=events,
+            config=self.config,
+            now=now,
+            trigger_reason=trigger_reason,
+        )
 
     def _append_audit(
         self,

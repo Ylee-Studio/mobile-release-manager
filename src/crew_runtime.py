@@ -7,11 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-try:  # pragma: no cover - tests may run without CrewAI installed
-    from crewai import Crew, Process
-except Exception:  # pragma: no cover
-    Crew = None  # type: ignore[assignment]
-    Process = None  # type: ignore[assignment]
+from crewai import Crew, Process
 
 from .agents import build_orchestrator_agent, build_release_manager_agent
 from .observability import CrewRuntimeCallbacks
@@ -22,24 +18,7 @@ from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool
 from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, SlackMessageTool, SlackUpdateTool
 from .workflow_state import ReleaseStep, WorkflowState
 
-try:  # pragma: no cover - optional crewai flow support
-    from crewai.flow.flow import Flow, listen, start
-except Exception:  # pragma: no cover - fallback for tests without crewai
-    class Flow:  # type: ignore[override]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__()
-
-    def start() -> Any:  # type: ignore[override]
-        def _decorator(func: Any) -> Any:
-            return func
-
-        return _decorator
-
-    def listen(_event: Any) -> Any:  # type: ignore[override]
-        def _decorator(func: Any) -> Any:
-            return func
-
-        return _decorator
+from crewai.flow.flow import Flow, listen, start
 
 try:  # pragma: no cover - optional decorator path varies by crewai version
     from crewai.flow.flow import persist
@@ -186,24 +165,6 @@ class CrewRuntimeCoordinator:
                 audit_reason=f"crew_runtime_error:{exc.__class__.__name__}",
             )
 
-    def decide(
-        self,
-        *,
-        state: WorkflowState,
-        events: list[SlackEvent],
-        config: Any,
-        now: datetime | None = None,
-        trigger_reason: str = "heartbeat_timer",
-    ) -> CrewDecision:
-        """Backward-compatible alias for flow kickoff."""
-        return self.kickoff(
-            state=state,
-            events=events,
-            config=config,
-            now=now,
-            trigger_reason=trigger_reason,
-        )
-
     def _run_flow_orchestrator_turn(self, *, inputs: dict[str, Any]) -> FlowTurnContext:
         state = inputs["state"]
         events = inputs["events"]
@@ -313,9 +274,7 @@ class CrewRuntimeCoordinator:
             self._orchestrator_crew = self._build_orchestrator_crew()
         result = self._execute_crew(
             crew=self._orchestrator_crew,
-            agent=self._orchestrator_agent,
             payload=payload,
-            task_builder=build_orchestrator_task,
         )
         return _extract_structured_payload(result), extract_native_tool_calls(result)
 
@@ -331,9 +290,7 @@ class CrewRuntimeCoordinator:
         self._release_manager_agents[key] = release_manager_agent
         return release_manager_agent
 
-    def _build_orchestrator_crew(self) -> Any | None:
-        if Crew is None or Process is None:
-            return None
+    def _build_orchestrator_crew(self) -> Any:
         task = build_orchestrator_task(agent=self._orchestrator_agent, slack_tools=self.slack_tools)
         return Crew(
             agents=[self._orchestrator_agent],
@@ -345,9 +302,7 @@ class CrewRuntimeCoordinator:
             task_callback=self.callbacks.on_task,
         )
 
-    def _build_release_manager_crew(self, *, release_version: str, agent: Any) -> Any | None:
-        if Crew is None or Process is None:
-            return None
+    def _build_release_manager_crew(self, *, release_version: str, agent: Any) -> Any:
         _ = release_version
         task = build_release_manager_task(agent=agent, slack_tools=self.slack_tools)
         return Crew(
@@ -394,35 +349,19 @@ class CrewRuntimeCoordinator:
             self._release_manager_crews[release_version] = crew
         result = self._execute_crew(
             crew=crew,
-            agent=agent,
             payload=payload,
-            task_builder=build_release_manager_task,
         )
         return _extract_structured_payload(result), extract_native_tool_calls(result)
 
     def _execute_crew(
         self,
         *,
-        crew: Any | None,
-        agent: Any,
+        crew: Any,
         payload: dict[str, Any],
-        task_builder: Any,
     ) -> Any:
-        if crew is not None and hasattr(crew, "kickoff"):
-            return crew.kickoff(inputs=payload)
-
-        # Compatibility path for tests and environments where Crew is unavailable.
-        task = task_builder(
-            agent=agent,
-            slack_tools=self.slack_tools,
-        )
-        interpolator = getattr(task, "interpolate_inputs_and_add_conversation_history", None)
-        if callable(interpolator):
-            interpolator(payload)
-        return agent.execute_task(
-            task=task,
-            tools=self.slack_tools,
-        )
+        if not hasattr(crew, "kickoff"):
+            raise RuntimeError("Crew instance is required for runtime execution")
+        return crew.kickoff(inputs=payload)
 
     def _resolve_tool_calls(
         self,

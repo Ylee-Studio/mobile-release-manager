@@ -102,8 +102,8 @@ def test_orchestrator_session_created_once_and_reused(monkeypatch, tmp_path) -> 
     )
 
     state = WorkflowState()
-    coordinator.decide(state=state, events=[], config=_config())
-    coordinator.decide(state=state, events=[], config=_config())
+    coordinator.kickoff(state=state, events=[], config=_config())
+    coordinator.kickoff(state=state, events=[], config=_config())
 
     assert calls["orchestrator_agent"] == 1
     assert calls["orchestrator_task"] == 0
@@ -148,8 +148,8 @@ def test_release_manager_session_reused_per_release(monkeypatch, tmp_path) -> No
     )
 
     state = WorkflowState()
-    first = coordinator.decide(state=state, events=[], config=_config())
-    second = coordinator.decide(state=first.next_state, events=[], config=_config())
+    first = coordinator.kickoff(state=state, events=[], config=_config())
+    second = coordinator.kickoff(state=first.next_state, events=[], config=_config())
 
     assert first.actor == "release_manager"
     assert second.actor == "release_manager"
@@ -186,10 +186,10 @@ def test_release_manager_sessions_cleared_on_idle_transition(monkeypatch, tmp_pa
         memory_db_path=str(tmp_path / "memory.db"),
     )
 
-    first = coordinator.decide(state=WorkflowState(), events=[], config=_config())
+    first = coordinator.kickoff(state=WorkflowState(), events=[], config=_config())
     assert first.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert list(coordinator._release_manager_agents.keys()) == ["5.104.0"]
 
-    second = coordinator.decide(state=first.next_state, events=[], config=_config())
+    second = coordinator.kickoff(state=first.next_state, events=[], config=_config())
     assert second.next_step == ReleaseStep.IDLE
     assert coordinator._release_manager_agents == {}

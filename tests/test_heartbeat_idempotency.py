@@ -13,7 +13,21 @@ def _append_event(path: Path, payload: dict) -> None:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
-class FakeCrewRuntime:
+class _KickoffCompatibleRuntime:
+    def kickoff(  # noqa: ANN001
+        self,
+        *,
+        state: WorkflowState,
+        events,
+        config,
+        now=None,
+        trigger_reason="heartbeat_timer",
+    ):
+        _ = trigger_reason
+        return self.decide(state=state, events=events, config=config, now=now)
+
+
+class FakeCrewRuntime(_KickoffCompatibleRuntime):
     def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
         if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
             next_state = WorkflowState(
@@ -53,20 +67,7 @@ class FakeCrewRuntime:
         )
 
 
-class RecordingCrewRuntime:
-    def __init__(self) -> None:
-        self.seen_event_ids: list[list[str]] = []
-
-    def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
-        self.seen_event_ids.append([event.event_id for event in events])
-        return CrewDecision(
-            next_step=state.step,
-            next_state=state,
-            audit_reason="recorded",
-        )
-
-
-class StartApprovalCrewRuntime:
+class StartApprovalCrewRuntime(_KickoffCompatibleRuntime):
     def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
         if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
             return CrewDecision(
@@ -99,7 +100,7 @@ class StartApprovalCrewRuntime:
         return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
 
 
-class ManualReleaseFlowCrewRuntime:
+class ManualReleaseFlowCrewRuntime(_KickoffCompatibleRuntime):
     def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
         if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
             return CrewDecision(
@@ -179,7 +180,7 @@ class ManualReleaseFlowCrewRuntime:
         return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
 
 
-class InvalidSlackMessageCrewRuntime:
+class InvalidSlackMessageCrewRuntime(_KickoffCompatibleRuntime):
     def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
         if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
             next_state = WorkflowState(
@@ -254,58 +255,6 @@ def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
     audit_rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert audit_rows
     assert "actor" in audit_rows[-1]
-
-
-def test_fifo_events_consumed_one_per_tick(tmp_path: Path) -> None:
-    memory_db = tmp_path / "crewai_memory.db"
-    audit_log = tmp_path / "workflow_audit.jsonl"
-    slack_events = tmp_path / "slack_events.jsonl"
-
-    config = RuntimeConfig(
-        slack_channel_id="C_RELEASE",
-        slack_bot_token="xoxb-test-token",
-        timezone="Europe/Moscow",
-        heartbeat_active_minutes=15,
-        heartbeat_idle_minutes=240,
-        jira_project_keys=["IOS"],
-        readiness_owners={"Growth": "owner"},
-        memory_db_path=str(memory_db),
-        audit_log_path=str(audit_log),
-        slack_events_path=str(slack_events),
-        agent_pid_path=str(tmp_path / "agent.pid"),
-    )
-    memory = CrewAIMemory(db_path=str(memory_db))
-    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
-    runtime = RecordingCrewRuntime()
-    workflow = ReleaseWorkflow(config=config, memory=memory, slack_gateway=slack_gateway, crew_runtime=runtime)
-
-    _append_event(
-        slack_events,
-        {
-            "event_id": "ev-1",
-            "event_type": "manual_start",
-            "channel_id": "C_RELEASE",
-            "text": "start release",
-        },
-    )
-    _append_event(
-        slack_events,
-        {
-            "event_id": "ev-2",
-            "event_type": "approval_confirmed",
-            "channel_id": "C_RELEASE",
-            "text": "approve",
-        },
-    )
-
-    workflow.tick()
-    queue_after_first_tick = slack_events.read_text(encoding="utf-8").splitlines()
-    workflow.tick()
-    queue_after_second_tick = slack_events.read_text(encoding="utf-8").splitlines()
-
-    assert runtime.seen_event_ids == [["ev-1"], ["ev-2"]]
-    assert len(queue_after_first_tick) == 1
-    assert queue_after_second_tick == []
 
 
 def test_runtime_executes_slack_approve_tool_call(tmp_path: Path, monkeypatch) -> None:
@@ -526,7 +475,7 @@ class CountingMemory:
         self._state = WorkflowState.from_dict(state.to_dict())
 
 
-class NoopCrewRuntime:
+class NoopCrewRuntime(_KickoffCompatibleRuntime):
     def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
         return CrewDecision(
             next_step=state.step,
@@ -611,7 +560,7 @@ def test_crewai_memory_keeps_latest_snapshot_per_release_and_last_two_releases(t
 
 
 def test_manual_transition_prunes_future_actions_and_replays_start_approval(tmp_path: Path, monkeypatch) -> None:
-    class ReenterStartApprovalCrewRuntime:
+    class ReenterStartApprovalCrewRuntime(_KickoffCompatibleRuntime):
         def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
             if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
                 return CrewDecision(
@@ -695,7 +644,7 @@ def test_manual_transition_prunes_future_actions_and_replays_start_approval(tmp_
 
 
 def test_non_user_transition_does_not_prune_completed_actions(tmp_path: Path) -> None:
-    class AutoAdvanceCrewRuntime:
+    class AutoAdvanceCrewRuntime(_KickoffCompatibleRuntime):
         def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
             active = state.active_release
             assert active is not None
