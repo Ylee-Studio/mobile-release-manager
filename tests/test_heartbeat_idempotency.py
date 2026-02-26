@@ -133,13 +133,6 @@ def test_approval_event_resumes_paused_flow_once(tmp_path: Path) -> None:
 
     paused = workflow.tick(trigger_reason="heartbeat_timer")
     assert paused.is_paused is True
-    workflow.pending_store.put_pending(
-        message_ts="177.10",
-        thread_ts="177.10",
-        flow_id="flow-1",
-        approval_kind="WAIT_MANUAL_RELEASE_CONFIRMATION",
-        release_version="5.104.0",
-    )
 
     _append_event(
         events_path,
@@ -159,51 +152,3 @@ def test_approval_event_resumes_paused_flow_once(tmp_path: Path) -> None:
     assert resumed.flow_execution_id == "flow-1"
 
 
-def test_duplicate_approval_does_not_duplicate_transition(tmp_path: Path) -> None:
-    workflow = _build_workflow(tmp_path)
-    cfg = _runtime_config(tmp_path)
-    events_path = Path(cfg.slack_events_path)
-
-    workflow.tick(trigger_reason="heartbeat_timer")
-    workflow.pending_store.put_pending(
-        message_ts="177.20",
-        thread_ts="177.20",
-        flow_id="flow-1",
-        approval_kind="WAIT_MANUAL_RELEASE_CONFIRMATION",
-        release_version="5.104.0",
-    )
-    _append_event(
-        events_path,
-        {
-            "event_id": "ev-approve-1",
-            "event_type": "approval_confirmed",
-            "channel_id": "C_RELEASE",
-            "text": "Подтвердить",
-            "message_ts": "177.20",
-            "thread_ts": "177.20",
-        },
-    )
-    first_resume = workflow.tick(trigger_reason="signal_trigger")
-
-    workflow.pending_store.put_pending(
-        message_ts="177.21",
-        thread_ts="177.21",
-        flow_id="flow-1",
-        approval_kind="WAIT_MEETING_CONFIRMATION",
-        release_version="5.104.0",
-    )
-    _append_event(
-        events_path,
-        {
-            "event_id": "ev-approve-2",
-            "event_type": "approval_confirmed",
-            "channel_id": "C_RELEASE",
-            "text": "Подтвердить",
-            "message_ts": "177.21",
-            "thread_ts": "177.21",
-        },
-    )
-    second_resume = workflow.tick(trigger_reason="signal_trigger")
-
-    assert first_resume.step == ReleaseStep.WAIT_MEETING_CONFIRMATION
-    assert second_resume.step == ReleaseStep.WAIT_MEETING_CONFIRMATION

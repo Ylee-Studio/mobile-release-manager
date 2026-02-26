@@ -15,8 +15,6 @@ def test_decision_accepts_full_next_state() -> None:
                 "thread_ts": {},
                 "readiness_map": {"Growth": False},
             },
-            "processed_event_ids": ["ev-123"],
-            "completed_actions": {},
             "checkpoints": [],
         },
         "tool_calls": [{"tool": "slack_approve", "reason": "request approval"}],
@@ -33,18 +31,16 @@ def test_decision_supports_state_patch_merge() -> None:
     current = WorkflowState(
         active_release=None,
         previous_release_version="1.0.0",
-        processed_event_ids=["ev-1"],
-        completed_actions={},
         checkpoints=[],
     )
     payload = {
         "next_step": "IDLE",
-        "state_patch": {"processed_event_ids": ["ev-1", "ev-2"]},
+        "state_patch": {"pause_reason": "patched"},
         "audit_reason": "mark_event_processed",
     }
     decision = CrewDecision.from_payload(payload, current_state=current)
     assert decision.next_step == ReleaseStep.IDLE
-    assert decision.next_state.processed_event_ids == ["ev-1", "ev-2"]
+    assert decision.next_state.pause_reason == "patched"
 
 
 def test_decision_keeps_two_agent_contract_fields() -> None:
@@ -58,8 +54,6 @@ def test_decision_keeps_two_agent_contract_fields() -> None:
                 "thread_ts": {},
                 "readiness_map": {"Core": False},
             },
-            "processed_event_ids": [],
-            "completed_actions": {"start-approval:3.1.0": "done"},
             "checkpoints": [],
         },
         "tool_calls": [{"tool": "slack_update", "reason": "prepare release manager phase"}],
@@ -83,10 +77,6 @@ def test_decision_accepts_active_release_aliases_from_agent() -> None:
                 "status": "AWAITING_START_APPROVAL",
                 "channel_id": "C0AGLKF6KHD",
             },
-            "processed_event_ids": [
-                "cmd-10580876139110.3996647710994.f0a39e21fa2165c809123d7e4b957bd7"
-            ],
-            "completed_actions": {},
             "checkpoints": [],
         },
         "tool_calls": [{"tool": "slack_approve", "reason": "request approval"}],
@@ -109,8 +99,6 @@ def test_decision_accepts_manual_release_confirmation_alias_from_agent() -> None
                 "status": "AWAITING_MANUAL_RELEASE_CONFIRMATION",
                 "channel_id": "C0AGLKF6KHD",
             },
-            "processed_event_ids": ["ev-1"],
-            "completed_actions": {},
             "checkpoints": [],
         },
         "tool_calls": [{"tool": "slack_approve", "reason": "request manual release confirmation"}],

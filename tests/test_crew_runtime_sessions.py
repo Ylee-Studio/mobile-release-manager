@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.crew_runtime import CrewDecision, CrewRuntimeCoordinator, FlowTurnContext
+from src.crew_runtime import CrewDecision, CrewRuntimeCoordinator
 from src.policies import PolicyConfig
 from src.tools.slack_tools import SlackEvent, SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
@@ -98,36 +98,6 @@ def test_paused_flow_with_confirmation_event_runs_kickoff(monkeypatch, tmp_path)
     assert flow_calls["kickoff"] == 1
     assert decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
     assert decision.flow_lifecycle == "running"
-
-
-def test_maybe_pause_flow_marks_state_and_persists_pending(monkeypatch, tmp_path) -> None:
-    coordinator = _build_coordinator(monkeypatch, tmp_path)
-
-    decision = CrewDecision(
-        next_step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
-        next_state=WorkflowState(
-            active_release=ReleaseContext(
-                release_version="5.104.0",
-                step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
-            )
-        ),
-        flow_lifecycle="running",
-    )
-    ctx = FlowTurnContext(
-        payload={"events": []},
-        current_state=WorkflowState(),
-        orchestrator_payload={},
-        orchestrator_native_calls=[],
-        orchestrator_decision=decision,
-    )
-
-    coordinator.maybe_pause_flow(flow=coordinator.flow, decision=decision, context=ctx)
-
-    assert decision.flow_lifecycle == "paused"
-    assert decision.next_state.flow_execution_id
-    assert decision.next_state.flow_paused_at
-    pending = coordinator._flow_persistence.load_pending_feedback(decision.next_state.flow_execution_id)  # noqa: SLF001
-    assert pending is not None
 
 
 def test_resume_from_pending_uses_from_pending_flow(monkeypatch, tmp_path) -> None:

@@ -110,7 +110,10 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
             text=str(event.get("text", "")),
             thread_ts=event.get("thread_ts") or event.get("ts"),
             message_ts=event.get("ts"),
-            metadata={"source": "events_api"},
+            metadata={
+                "source": "events_api",
+                "user_id": event.get("user"),
+            },
         )
         self._trigger_event_processing()
         self._send_json(200, {"ok": True})

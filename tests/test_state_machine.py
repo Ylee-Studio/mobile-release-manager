@@ -21,10 +21,7 @@ def test_state_roundtrip_keeps_active_release() -> None:
             step=ReleaseStep.WAIT_START_APPROVAL,
             readiness_map={"Core": False},
         ),
-        processed_event_ids=["ev-1"],
-        completed_actions={"start-approval:5.101.0": "done"},
     )
     restored = WorkflowState.from_dict(state.to_dict())
     assert restored.active_release is not None
     assert restored.active_release.release_version == "5.101.0"
-    assert restored.processed_event_ids == ["ev-1"]

@@ -72,8 +72,6 @@ class WorkflowState:
     flow_execution_id: str | None = None
     flow_paused_at: str | None = None
     pause_reason: str | None = None
-    processed_event_ids: list[str] = field(default_factory=list)
-    completed_actions: dict[str, str] = field(default_factory=dict)
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -81,12 +79,6 @@ class WorkflowState:
         if not self.active_release:
             return ReleaseStep.IDLE
         return self.active_release.step
-
-    def is_action_done(self, action_key: str) -> bool:
-        return action_key in self.completed_actions
-
-    def mark_action_done(self, action_key: str) -> None:
-        self.completed_actions[action_key] = utc_now_iso()
 
     @property
     def is_paused(self) -> bool:
@@ -104,8 +96,6 @@ class WorkflowState:
             "flow_execution_id": self.flow_execution_id,
             "flow_paused_at": self.flow_paused_at,
             "pause_reason": self.pause_reason,
-            "processed_event_ids": self.processed_event_ids,
-            "completed_actions": self.completed_actions,
             "checkpoints": self.checkpoints,
         }
 
@@ -153,8 +143,6 @@ class WorkflowState:
             flow_execution_id=raw.get("flow_execution_id"),
             flow_paused_at=raw.get("flow_paused_at"),
             pause_reason=raw.get("pause_reason"),
-            processed_event_ids=list(raw.get("processed_event_ids", [])),
-            completed_actions=dict(raw.get("completed_actions", {})),
             checkpoints=list(raw.get("checkpoints", [])),
         )
 

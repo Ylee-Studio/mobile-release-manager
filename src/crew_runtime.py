@@ -26,7 +26,7 @@ from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, Slack
 from .workflow_state import ReleaseFlowState, ReleaseStep, WorkflowState
 
 from crewai.flow.flow import Flow, listen, router, start
-from crewai.flow.async_feedback.types import PendingFeedbackContext
+from crewai.flow.human_feedback import human_feedback
 
 try:  # pragma: no cover - optional persistence import path may vary
     from crewai.flow.persistence import SQLiteFlowPersistence
@@ -34,9 +34,11 @@ except Exception:  # pragma: no cover - tests without latest crewai
     SQLiteFlowPersistence = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional async feedback control-flow signal
-    from crewai.flow.async_feedback.types import HumanFeedbackPending
+    from crewai.flow.async_feedback.types import HumanFeedbackPending, HumanFeedbackProvider, PendingFeedbackContext
 except Exception:  # pragma: no cover
     HumanFeedbackPending = None  # type: ignore[assignment]
+    HumanFeedbackProvider = Any  # type: ignore[assignment]
+    PendingFeedbackContext = Any  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional decorator path varies by crewai version
     from crewai.flow.flow import persist
@@ -111,6 +113,24 @@ class FlowTurnContext:
     orchestrator_decision: CrewDecision
 
 
+class AsyncHumanFeedbackProvider(HumanFeedbackProvider):
+    """Async provider that pauses Flow and waits for external feedback events."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:  # noqa: ARG002
+        if HumanFeedbackPending is None:
+            raise RuntimeError("HumanFeedbackPending is unavailable in current CrewAI version.")
+        raise HumanFeedbackPending(
+            context=context,
+            callback_info={
+                "flow_id": context.flow_id,
+                "method_name": context.method_name,
+            },
+        )
+
+
+_ASYNC_HUMAN_FEEDBACK_PROVIDER = AsyncHumanFeedbackProvider()
+
+
 @persist()
 class ReleaseFlow(Flow[ReleaseFlowState]):
     """Release workflow as explicit step-routed CrewAI Flow."""
@@ -151,44 +171,85 @@ class ReleaseFlow(Flow[ReleaseFlowState]):
 
     @listen(ReleaseStep.IDLE.value)
     def on_idle(self, _label: str) -> CrewDecision:
-        decision = self.coordinator.handle_step_idle(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
-        return decision
+        return self.coordinator.handle_step_idle(context=self._context())
 
     @listen(ReleaseStep.WAIT_START_APPROVAL.value)
     def on_wait_start_approval(self, _label: str) -> CrewDecision:
         decision = self.coordinator.handle_step_wait_start_approval(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        if self._should_pause_gate(decision=decision, gate_step=ReleaseStep.WAIT_START_APPROVAL):
+            return self.gate_wait_start_approval(decision)
         return decision
 
     @listen(ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value)
     def on_wait_manual_release_confirmation(self, _label: str) -> CrewDecision:
         decision = self.coordinator.handle_step_wait_manual_release_confirmation(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        if self._should_pause_gate(decision=decision, gate_step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION):
+            return self.gate_wait_manual_release_confirmation(decision)
         return decision
 
     @listen(ReleaseStep.WAIT_MEETING_CONFIRMATION.value)
     def on_wait_meeting_confirmation(self, _label: str) -> CrewDecision:
         decision = self.coordinator.handle_step_wait_meeting_confirmation(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        if self._should_pause_gate(decision=decision, gate_step=ReleaseStep.WAIT_MEETING_CONFIRMATION):
+            return self.gate_wait_meeting_confirmation(decision)
         return decision
 
     @listen(ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value)
     def on_wait_readiness_confirmations(self, _label: str) -> CrewDecision:
-        decision = self.coordinator.handle_step_wait_readiness_confirmations(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
-        return decision
+        return self.coordinator.handle_step_wait_readiness_confirmations(context=self._context())
 
     @listen(ReleaseStep.READY_FOR_BRANCH_CUT.value)
     def on_ready_for_branch_cut(self, _label: str) -> CrewDecision:
-        decision = self.coordinator.handle_step_ready_for_branch_cut(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
-        return decision
+        return self.coordinator.handle_step_ready_for_branch_cut(context=self._context())
 
     @listen("UNKNOWN_STEP")
     def on_unknown_step(self, _label: str) -> CrewDecision:
-        decision = self.coordinator.handle_step_unknown(context=self._context())
-        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return self.coordinator.handle_step_unknown(context=self._context())
+
+    @human_feedback(
+        message="Awaiting release train start confirmation.",
+        provider=_ASYNC_HUMAN_FEEDBACK_PROVIDER,
+    )
+    def gate_wait_start_approval(self, decision: CrewDecision) -> CrewDecision:
+        return self._mark_paused(
+            decision=decision,
+            pause_reason=f"awaiting_confirmation:{ReleaseStep.WAIT_START_APPROVAL.value}",
+        )
+
+    @human_feedback(
+        message="Awaiting manual Jira release confirmation.",
+        provider=_ASYNC_HUMAN_FEEDBACK_PROVIDER,
+    )
+    def gate_wait_manual_release_confirmation(self, decision: CrewDecision) -> CrewDecision:
+        return self._mark_paused(
+            decision=decision,
+            pause_reason=f"awaiting_confirmation:{ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value}",
+        )
+
+    @human_feedback(
+        message="Awaiting release fixation meeting confirmation.",
+        provider=_ASYNC_HUMAN_FEEDBACK_PROVIDER,
+    )
+    def gate_wait_meeting_confirmation(self, decision: CrewDecision) -> CrewDecision:
+        return self._mark_paused(
+            decision=decision,
+            pause_reason=f"awaiting_confirmation:{ReleaseStep.WAIT_MEETING_CONFIRMATION.value}",
+        )
+
+    def _should_pause_gate(self, *, decision: CrewDecision, gate_step: ReleaseStep) -> bool:
+        if decision.next_step != gate_step:
+            return False
+        context = self._context()
+        return not _has_resume_event(context.payload.get("events", []))
+
+    @staticmethod
+    def _mark_paused(*, decision: CrewDecision, pause_reason: str) -> CrewDecision:
+        next_state = decision.next_state
+        if not next_state.flow_execution_id:
+            next_state.flow_execution_id = str(uuid.uuid4())
+        next_state.flow_paused_at = datetime.now(timezone.utc).isoformat()
+        next_state.pause_reason = pause_reason
+        decision.flow_lifecycle = "paused"
         return decision
 
     def _context(self) -> FlowTurnContext:
@@ -307,10 +368,6 @@ class CrewRuntimeCoordinator:
                 coordinator=self,
             )
             restored_flow.resume(feedback)
-            if self._flow_persistence is not None:
-                clear_method = getattr(self._flow_persistence, "clear_pending_feedback", None)
-                if callable(clear_method):
-                    clear_method(normalized_flow_id)
             next_state = WorkflowState.from_dict(state.to_dict())
             next_state.flow_execution_id = normalized_flow_id
             next_state.flow_paused_at = None
@@ -492,56 +549,6 @@ class CrewRuntimeCoordinator:
 
     def handle_step_unknown(self, *, context: FlowTurnContext) -> CrewDecision:
         return self._run_flow_release_manager_turn(context=context)
-
-    def maybe_pause_flow(self, *, flow: Any, decision: CrewDecision, context: FlowTurnContext) -> None:
-        if not _step_requires_human_confirmation(decision.next_step):
-            return
-        if _has_resume_event(context.payload.get("events", [])):
-            return
-        next_state = decision.next_state
-        if not next_state.flow_execution_id:
-            next_state.flow_execution_id = str(uuid.uuid4())
-        next_state.flow_paused_at = datetime.now(timezone.utc).isoformat()
-        next_state.pause_reason = f"awaiting_confirmation:{decision.next_step.value}"
-        decision.flow_lifecycle = "paused"
-        if self._flow_persistence is None:
-            return
-        try:
-            context_payload = PendingFeedbackContext(
-                flow_id=next_state.flow_execution_id,
-                flow_class=f"{flow.__class__.__module__}.{flow.__class__.__name__}",
-                method_name=f"gate_{decision.next_step.value.lower()}",
-                method_output={
-                    "next_step": decision.next_step.value,
-                    "audit_reason": decision.audit_reason,
-                },
-                message=next_state.pause_reason,
-                emit=None,
-                default_outcome=None,
-                metadata={
-                    "pause_reason": next_state.pause_reason,
-                    "release_version": (
-                        next_state.active_release.release_version if next_state.active_release else ""
-                    ),
-                    "step": decision.next_step.value,
-                },
-                llm=None,
-            )
-            state_data: dict[str, Any]
-            if hasattr(flow, "state") and hasattr(flow.state, "model_dump"):
-                state_data = dict(flow.state.model_dump())
-            elif hasattr(flow, "state") and isinstance(flow.state, dict):
-                state_data = dict(flow.state)
-            else:
-                state_data = {}
-            state_data["id"] = next_state.flow_execution_id
-            self._flow_persistence.save_pending_feedback(
-                next_state.flow_execution_id,
-                context_payload,
-                state_data,
-            )
-        except Exception:
-            self.logger.debug("flow pending persistence failed", exc_info=True)
 
     @staticmethod
     def _event_to_dict(event: SlackEvent) -> dict[str, Any]:
@@ -782,15 +789,6 @@ def _step_requires_release_manager(step: ReleaseStep) -> bool:
         ReleaseStep.WAIT_MEETING_CONFIRMATION,
         ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
         ReleaseStep.READY_FOR_BRANCH_CUT,
-    }
-
-
-def _step_requires_human_confirmation(step: ReleaseStep) -> bool:
-    return step in {
-        ReleaseStep.WAIT_START_APPROVAL,
-        ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
-        ReleaseStep.WAIT_MEETING_CONFIRMATION,
-        ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
     }
 
 
