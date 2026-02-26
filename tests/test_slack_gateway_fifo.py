@@ -94,3 +94,63 @@ def test_pending_events_count_ignores_empty_lines(tmp_path: Path) -> None:
     )
 
     assert gateway.pending_events_count() == 2
+
+
+def test_add_reaction_calls_reactions_add(tmp_path: Path, monkeypatch) -> None:
+    gateway = SlackGateway(
+        bot_token="xoxb-test-token",
+        events_path=tmp_path / "slack_events.jsonl",
+    )
+    captured: list[tuple[str, dict[str, str]]] = []
+
+    def _fake_request_json(*, method_name: str, payload: dict[str, str]) -> dict[str, bool]:
+        captured.append((method_name, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(gateway, "_request_json", _fake_request_json)
+
+    added = gateway.add_reaction("C_RELEASE", "1700000000.123456", "eyes")
+
+    assert added is True
+    assert captured == [
+        (
+            "reactions.add",
+            {
+                "channel": "C_RELEASE",
+                "timestamp": "1700000000.123456",
+                "name": "eyes",
+            },
+        )
+    ]
+
+
+def test_add_reaction_treats_already_reacted_as_success(tmp_path: Path, monkeypatch) -> None:
+    gateway = SlackGateway(
+        bot_token="xoxb-test-token",
+        events_path=tmp_path / "slack_events.jsonl",
+    )
+
+    def _fake_request_json(*, method_name: str, payload: dict[str, str]) -> dict[str, bool]:  # noqa: ARG001
+        raise RuntimeError("Slack API reactions.add failed: already_reacted")
+
+    monkeypatch.setattr(gateway, "_request_json", _fake_request_json)
+
+    added = gateway.add_reaction("C_RELEASE", "1700000000.123456", "eyes")
+
+    assert added is False
+
+
+def test_add_reaction_treats_missing_scope_as_non_fatal(tmp_path: Path, monkeypatch) -> None:
+    gateway = SlackGateway(
+        bot_token="xoxb-test-token",
+        events_path=tmp_path / "slack_events.jsonl",
+    )
+
+    def _fake_request_json(*, method_name: str, payload: dict[str, str]) -> dict[str, bool]:  # noqa: ARG001
+        raise RuntimeError("Slack API reactions.add failed: missing_scope")
+
+    monkeypatch.setattr(gateway, "_request_json", _fake_request_json)
+
+    added = gateway.add_reaction("C_RELEASE", "1700000000.123456", "eyes")
+
+    assert added is False

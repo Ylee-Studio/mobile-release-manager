@@ -21,9 +21,10 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
             "a release-specific manager."
         ),
         backstory=(
-            "You monitor heartbeat context and incoming events, determine the next "
+            "You monitor flow execution context and incoming events, determine the next "
             "workflow step, and create Release Manager X.Y.Z when a release enters "
-            "execution phases."
+            "execution phases. The runtime uses Flow lifecycle transitions "
+            "(kickoff, pause, resume, completion) for human confirmation gates."
         ),
         allow_delegation=False,
         verbose=policies.agent_verbose,
@@ -32,9 +33,14 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
         max_execution_time=policies.max_execution_time_seconds,
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
-            "tool_calls, audit_reason, and optional invoke_release_manager flag. "
+            "tool_calls, audit_reason, flow_lifecycle, and optional invoke_release_manager flag. "
             "You are responsible for routing and state transitions, not release-manager side effects. "
             f"{_TOOL_FORMAT_RULE} "
+            "For human confirmation gates keep flow_lifecycle='paused' and do not force progress "
+            "until approval_confirmed event arrives. "
+            "On resume after approval_confirmed the runtime restores flow via from_pending(flow_id); "
+            "set flow_lifecycle='running' and advance to the next step. "
+            "Set flow_lifecycle='completed' only when the release flow is actually finished (typically IDLE with no active release). "
             "If next_step is in release-manager phases "
             "(WAIT_MANUAL_RELEASE_CONFIRMATION, WAIT_MEETING_CONFIRMATION, "
             "WAIT_READINESS_CONFIRMATIONS, "
@@ -43,7 +49,8 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
             "Set invoke_release_manager=true only when an active release exists and the "
             "release manager must process release-specific side effects. Keep state "
             "consistent with ReleaseStep enum and track incoming events using "
-            "state.processed_event_ids. "
+            "state.processed_event_ids. Maintain pause metadata in state fields "
+            "flow_execution_id, flow_paused_at, pause_reason consistently with flow_lifecycle. "
             "Never emit `slack_message` tool calls without non-empty `args.text`."
         ),
     )
@@ -69,7 +76,7 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
         max_execution_time=policies.max_execution_time_seconds,
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
-            "tool_calls, and audit_reason. Use only the active release context and "
+            "tool_calls, audit_reason, and flow_lifecycle. Use only the active release context and "
             f"{_TOOL_FORMAT_RULE} "
             "Analyze incoming events. Use exactly one `slack_approve` tool call to request "
             "manual release confirmation when transitioning to "
@@ -92,6 +99,8 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
             "If you cannot produce that message, do not move to WAIT_READINESS_CONFIRMATIONS. "
             "When tools return message_ts, persist it into "
             "next_state.active_release.message_ts/thread_ts where applicable. "
-            "Emit tool calls only for the current transition and avoid repeating them when no new trigger event exists."
+            "Emit tool calls only for the current transition and avoid repeating them when no new trigger event exists. "
+            "When waiting for confirmation, return flow_lifecycle='paused'; when handling approval_confirmed and moving forward, "
+            "return flow_lifecycle='running'. Assume pending feedback context will be resumed via from_pending(flow_id)."
         ),
     )

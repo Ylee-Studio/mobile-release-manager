@@ -17,17 +17,21 @@ class CrewRuntimeCallbacks:
         self.logger = logging.getLogger(self.logger_name)
 
     def on_step(self, *args: Any, **kwargs: Any) -> None:
+        lifecycle = kwargs.get("flow_lifecycle") if isinstance(kwargs, dict) else None
         self.logger.info(
-            "crew_step at=%s args=%s kwargs=%s",
+            "crew_step at=%s args=%s kwargs=%s lifecycle=%s",
             datetime.now(timezone.utc).isoformat(),
             len(args),
             sorted(kwargs.keys()),
+            lifecycle,
         )
 
     def on_task(self, *args: Any, **kwargs: Any) -> None:
+        lifecycle = kwargs.get("flow_lifecycle") if isinstance(kwargs, dict) else None
         self.logger.info(
-            "crew_task at=%s args=%s kwargs=%s",
+            "crew_task at=%s args=%s kwargs=%s lifecycle=%s",
             datetime.now(timezone.utc).isoformat(),
             len(args),
             sorted(kwargs.keys()),
+            lifecycle,
         )

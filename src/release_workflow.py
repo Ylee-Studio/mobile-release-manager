@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from .crew_memory import CrewAIMemory
 from .crew_runtime import CrewDecision, CrewRuntimeCoordinator
+from .flow_pending_store import FlowPendingStore
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
 from .tools.slack_tools import (
     SlackApproveInput,
@@ -62,6 +63,8 @@ class ReleaseWorkflow:
         self.crew_runtime = crew_runtime
         self.audit_log_path = Path(config.audit_log_path)
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        pending_store_path = Path(config.memory_db_path).with_suffix("").parent / "flow_pending_store.json"
+        self.pending_store = FlowPendingStore(path=pending_store_path)
         self.logger = logging.getLogger("release_workflow")
         self._state = self.memory.load_state()
 
@@ -76,6 +79,7 @@ class ReleaseWorkflow:
         events = self.slack_gateway.poll_events()
         queue_remaining = self.slack_gateway.pending_events_count()
         trace_id = str(uuid.uuid4())
+        self._add_processing_reactions(events=events)
 
         decision = self._run_runtime_decision(
             state=state,
@@ -134,6 +138,55 @@ class ReleaseWorkflow:
         now: datetime | None,
         trigger_reason: str,
     ) -> CrewDecision:
+        if state.is_paused and _has_approval_confirmed(events):
+            pending = self._lookup_pending_context(events=events)
+            approval_event = _extract_latest_approval_event(events)
+            pending_key = _pending_key_from_event(approval_event)
+            if pending is None:
+                return CrewDecision(
+                    next_step=state.step,
+                    next_state=state,
+                    audit_reason=f"flow_id_lookup_status:missing;pending_key:{pending_key}",
+                    actor="flow_runtime",
+                    flow_lifecycle="paused",
+                )
+            feedback = str(getattr(_extract_latest_approval_event(events), "text", "") or "").strip()
+            resume_decision = self.crew_runtime.resume_from_pending(
+                flow_id=str(pending.get("flow_id", "")),
+                feedback=feedback,
+                state=state,
+            )
+            if resume_decision.flow_lifecycle == "error":
+                return resume_decision
+            self.pending_store.mark_resolved(
+                flow_id=str(pending.get("flow_id", "")),
+                message_ts=str(pending.get("message_ts", "")),
+            )
+            decision = self.start_or_continue_release(
+                state=state,
+                events=events,
+                now=now,
+                trigger_reason=trigger_reason,
+            )
+            decision.audit_reason = (
+                f"flow_id_lookup_status:found;pending_key:{pending_key};{decision.audit_reason}"
+            )
+            return decision
+        return self.start_or_continue_release(
+            state=state,
+            events=events,
+            now=now,
+            trigger_reason=trigger_reason,
+        )
+
+    def start_or_continue_release(
+        self,
+        *,
+        state: WorkflowState,
+        events: list[Any],
+        now: datetime | None,
+        trigger_reason: str,
+    ) -> CrewDecision:
         return self.crew_runtime.kickoff(
             state=state,
             events=events,
@@ -141,6 +194,57 @@ class ReleaseWorkflow:
             now=now,
             trigger_reason=trigger_reason,
         )
+
+    def resume_on_event(
+        self,
+        *,
+        state: WorkflowState,
+        events: list[Any],
+        now: datetime | None,
+        trigger_reason: str,
+    ) -> CrewDecision:
+        return self.crew_runtime.kickoff(
+            state=state,
+            events=events,
+            config=self.config,
+            now=now,
+            trigger_reason=trigger_reason,
+        )
+
+    def _add_processing_reactions(self, *, events: list[Any]) -> None:
+        for event in events:
+            channel_id = str(getattr(event, "channel_id", "") or "").strip()
+            message_ts = str(getattr(event, "message_ts", "") or "").strip()
+            if not channel_id or not message_ts:
+                continue
+            try:
+                self.slack_gateway.add_reaction(
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                    emoji="eyes",
+                )
+            except Exception as exc:  # pragma: no cover - runtime safety
+                self.logger.warning(
+                    "failed to add processing reaction channel=%s ts=%s: %s",
+                    channel_id,
+                    message_ts,
+                    exc,
+                )
+
+    def _lookup_pending_context(self, *, events: list[Any]) -> dict[str, Any] | None:
+        approval_event = _extract_latest_approval_event(events)
+        if approval_event is None:
+            return None
+        message_ts = str(getattr(approval_event, "message_ts", "") or "").strip()
+        thread_ts = str(getattr(approval_event, "thread_ts", "") or "").strip()
+        pending = self.pending_store.get_pending(message_ts=message_ts, thread_ts=thread_ts)
+        if pending is None:
+            self.logger.warning(
+                "pending flow_id mapping not found for approval event message_ts=%s thread_ts=%s",
+                message_ts,
+                thread_ts,
+            )
+        return pending
 
     def _append_audit(
         self,
@@ -155,6 +259,10 @@ class ReleaseWorkflow:
         payload = {
             "trace_id": trace_id,
             "actor": decision.actor,
+            "flow_lifecycle": decision.flow_lifecycle,
+            "flow_event": _flow_event_from_lifecycle(decision.flow_lifecycle),
+            "flow_id_lookup_status": _audit_field(decision.audit_reason, "flow_id_lookup_status"),
+            "pending_key": _audit_field(decision.audit_reason, "pending_key"),
             "event_count": len(events),
             "events": events,
             "incoming_slack_messages": incoming_slack_messages,
@@ -169,8 +277,9 @@ class ReleaseWorkflow:
         with self.audit_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
         self.logger.info(
-            "trace_id=%s decision next_step=%s reason=%s events=%s incoming_slack_messages=%s",
+            "trace_id=%s lifecycle=%s decision next_step=%s reason=%s events=%s incoming_slack_messages=%s",
             trace_id,
+            decision.flow_lifecycle,
             decision.next_step.value,
             decision.audit_reason,
             len(events),
@@ -311,6 +420,15 @@ class ReleaseWorkflow:
         release.slack_channel_id = channel_id
         release.message_ts[message_key] = message_ts
         release.thread_ts[message_key] = message_ts
+        flow_id = str(decision.next_state.flow_execution_id or "").strip()
+        if flow_id:
+            self.pending_store.put_pending(
+                message_ts=message_ts,
+                thread_ts=message_ts,
+                flow_id=flow_id,
+                approval_kind=decision.next_step.value,
+                release_version=release.release_version,
+            )
         decision.next_state.checkpoints.append(
             {
                 "phase": "after",
@@ -382,6 +500,19 @@ class ReleaseWorkflow:
         message_ts = str(result.get("message_ts", "")).strip()
         if message_ts and release is not None and message_key:
             release.message_ts[message_key] = message_ts
+        if (
+            release is not None
+            and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+            and message_ts
+            and decision.next_state.flow_execution_id
+        ):
+            self.pending_store.put_pending(
+                message_ts=message_ts,
+                thread_ts=thread_ts_value or message_ts,
+                flow_id=decision.next_state.flow_execution_id,
+                approval_kind=decision.next_step.value,
+                release_version=release.release_version,
+            )
         if release is not None:
             release.slack_channel_id = channel_id
         decision.next_state.checkpoints.append(
@@ -583,6 +714,42 @@ def _action_step(action_key: str) -> ReleaseStep | None:
             return ReleaseStep(maybe_step)
         except ValueError:
             return None
+    return None
+
+
+def _has_approval_confirmed(events: list[Any]) -> bool:
+    for event in events:
+        if str(getattr(event, "event_type", "")).strip() == "approval_confirmed":
+            return True
+    return False
+
+
+def _flow_event_from_lifecycle(lifecycle: str) -> str:
+    normalized = str(lifecycle or "").strip().lower()
+    if normalized == "paused":
+        return "flow_paused"
+    if normalized == "completed":
+        return "flow_completed"
+    if normalized == "running":
+        return "flow_resumed"
+    return "flow_transition"
+
+
+def _pending_key_from_event(event: Any | None) -> str:
+    if event is None:
+        return ""
+    message_ts = str(getattr(event, "message_ts", "") or "").strip()
+    thread_ts = str(getattr(event, "thread_ts", "") or "").strip()
+    return message_ts or thread_ts
+
+
+def _audit_field(audit_reason: str, key: str) -> str | None:
+    target = f"{key}:"
+    for part in str(audit_reason or "").split(";"):
+        normalized = part.strip()
+        if not normalized.startswith(target):
+            continue
+        return normalized.split(":", 1)[-1].strip() or None
     return None
 
 

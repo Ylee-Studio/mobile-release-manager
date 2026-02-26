@@ -82,6 +82,31 @@ class SlackGateway:
             },
         )
 
+    def add_reaction(self, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:
+        """Add reaction to a message; treat duplicate reaction as success."""
+        try:
+            self._request_json(
+                method_name="reactions.add",
+                payload={
+                    "channel": channel_id,
+                    "timestamp": message_ts,
+                    "name": emoji,
+                },
+            )
+            return True
+        except RuntimeError as exc:
+            error_text = str(exc)
+            if "already_reacted" in error_text or "missing_scope" in error_text:
+                self.logger.debug(
+                    "reaction skipped channel=%s ts=%s emoji=%s reason=%s",
+                    channel_id,
+                    message_ts,
+                    emoji,
+                    "already_reacted" if "already_reacted" in error_text else "missing_scope",
+                )
+                return False
+            raise
+
     def poll_events(self) -> list[SlackEvent]:
         if not self.events_path.exists():
             return []

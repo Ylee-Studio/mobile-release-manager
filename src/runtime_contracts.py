@@ -19,6 +19,7 @@ class AgentDecisionPayload(BaseModel):
     tool_calls: list[ToolCallPayload] = Field(default_factory=list)
     audit_reason: str = "agent_decision"
     invoke_release_manager: bool = False
+    flow_lifecycle: str = "running"
 
     def to_payload(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)

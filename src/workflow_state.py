@@ -69,6 +69,9 @@ class WorkflowState:
     active_release: ReleaseContext | None = None
     previous_release_version: str | None = None
     previous_release_completed_at: str | None = None
+    flow_execution_id: str | None = None
+    flow_paused_at: str | None = None
+    pause_reason: str | None = None
     processed_event_ids: list[str] = field(default_factory=list)
     completed_actions: dict[str, str] = field(default_factory=dict)
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
@@ -85,6 +88,10 @@ class WorkflowState:
     def mark_action_done(self, action_key: str) -> None:
         self.completed_actions[action_key] = utc_now_iso()
 
+    @property
+    def is_paused(self) -> bool:
+        return bool(self.flow_execution_id and self.flow_paused_at)
+
     def to_dict(self) -> dict[str, Any]:
         active = None
         if self.active_release:
@@ -94,6 +101,9 @@ class WorkflowState:
             "active_release": active,
             "previous_release_version": self.previous_release_version,
             "previous_release_completed_at": self.previous_release_completed_at,
+            "flow_execution_id": self.flow_execution_id,
+            "flow_paused_at": self.flow_paused_at,
+            "pause_reason": self.pause_reason,
             "processed_event_ids": self.processed_event_ids,
             "completed_actions": self.completed_actions,
             "checkpoints": self.checkpoints,
@@ -140,6 +150,9 @@ class WorkflowState:
             active_release=active_release,
             previous_release_version=raw.get("previous_release_version"),
             previous_release_completed_at=raw.get("previous_release_completed_at"),
+            flow_execution_id=raw.get("flow_execution_id"),
+            flow_paused_at=raw.get("flow_paused_at"),
+            pause_reason=raw.get("pause_reason"),
             processed_event_ids=list(raw.get("processed_event_ids", [])),
             completed_actions=dict(raw.get("completed_actions", {})),
             checkpoints=list(raw.get("checkpoints", [])),

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,17 @@ from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, Slack
 from .workflow_state import ReleaseFlowState, ReleaseStep, WorkflowState
 
 from crewai.flow.flow import Flow, listen, router, start
+from crewai.flow.async_feedback.types import PendingFeedbackContext
+
+try:  # pragma: no cover - optional persistence import path may vary
+    from crewai.flow.persistence import SQLiteFlowPersistence
+except Exception:  # pragma: no cover - tests without latest crewai
+    SQLiteFlowPersistence = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional async feedback control-flow signal
+    from crewai.flow.async_feedback.types import HumanFeedbackPending
+except Exception:  # pragma: no cover
+    HumanFeedbackPending = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional decorator path varies by crewai version
     from crewai.flow.flow import persist
@@ -46,6 +58,7 @@ class CrewDecision:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     audit_reason: str = "agent_decision"
     actor: str = "orchestrator"
+    flow_lifecycle: str = "running"
 
     @classmethod
     def from_payload(
@@ -85,6 +98,7 @@ class CrewDecision:
             tool_calls=tool_calls if isinstance(tool_calls, list) else [],
             audit_reason=audit_reason,
             actor=actor,
+            flow_lifecycle=str(payload.get("flow_lifecycle", "running")),
         )
 
 
@@ -101,8 +115,8 @@ class FlowTurnContext:
 class ReleaseFlow(Flow[ReleaseFlowState]):
     """Release workflow as explicit step-routed CrewAI Flow."""
 
-    def __init__(self, *, coordinator: "CrewRuntimeCoordinator") -> None:
-        super().__init__()
+    def __init__(self, *, coordinator: "CrewRuntimeCoordinator", persistence: Any | None = None) -> None:
+        super().__init__(persistence=persistence)
         self.coordinator = coordinator
         self._current_context: FlowTurnContext | None = None
 
@@ -137,31 +151,45 @@ class ReleaseFlow(Flow[ReleaseFlowState]):
 
     @listen(ReleaseStep.IDLE.value)
     def on_idle(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_idle(context=self._context())
+        decision = self.coordinator.handle_step_idle(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     @listen(ReleaseStep.WAIT_START_APPROVAL.value)
     def on_wait_start_approval(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_wait_start_approval(context=self._context())
+        decision = self.coordinator.handle_step_wait_start_approval(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     @listen(ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value)
     def on_wait_manual_release_confirmation(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_wait_manual_release_confirmation(context=self._context())
+        decision = self.coordinator.handle_step_wait_manual_release_confirmation(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     @listen(ReleaseStep.WAIT_MEETING_CONFIRMATION.value)
     def on_wait_meeting_confirmation(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_wait_meeting_confirmation(context=self._context())
+        decision = self.coordinator.handle_step_wait_meeting_confirmation(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     @listen(ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value)
     def on_wait_readiness_confirmations(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_wait_readiness_confirmations(context=self._context())
+        decision = self.coordinator.handle_step_wait_readiness_confirmations(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     @listen(ReleaseStep.READY_FOR_BRANCH_CUT.value)
     def on_ready_for_branch_cut(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_ready_for_branch_cut(context=self._context())
+        decision = self.coordinator.handle_step_ready_for_branch_cut(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     @listen("UNKNOWN_STEP")
     def on_unknown_step(self, _label: str) -> CrewDecision:
-        return self.coordinator.handle_step_unknown(context=self._context())
+        decision = self.coordinator.handle_step_unknown(context=self._context())
+        self.coordinator.maybe_pause_flow(flow=self, decision=decision, context=self._context())
+        return decision
 
     def _context(self) -> FlowTurnContext:
         if self._current_context is None:
@@ -195,7 +223,8 @@ class CrewRuntimeCoordinator:
         self._release_manager_crews: dict[str, Any] = {}
         self._orchestrator_memory = self._build_crewai_memory_scope(scope_name="orchestrator")
         self._release_manager_memories: dict[str, Any] = {}
-        self.flow = ReleaseFlow(coordinator=self)
+        self._flow_persistence = self._build_flow_persistence()
+        self.flow = ReleaseFlow(coordinator=self, persistence=self._flow_persistence)
 
     def kickoff(
         self,
@@ -206,6 +235,15 @@ class CrewRuntimeCoordinator:
         now: datetime | None = None,
         trigger_reason: str = "heartbeat_timer",
     ) -> CrewDecision:
+        if state.is_paused and not _has_resume_event(events):
+            return CrewDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason=f"flow_paused_waiting_confirmation:{state.pause_reason or 'unknown'}",
+                actor="flow_runtime",
+                flow_lifecycle="paused",
+            )
+
         inputs = {
             "state": state.to_dict(),
             "events": [self._event_to_dict(event) for event in events],
@@ -219,7 +257,9 @@ class CrewRuntimeCoordinator:
             "trigger_reason": trigger_reason,
         }
         try:
-            return self.flow.kickoff(inputs=inputs)
+            decision = self._flow_kickoff(inputs=inputs)
+            self._finalize_flow_metadata(decision=decision, previous_state=state, action="kickoff")
+            return decision
         except Exception as exc:  # pragma: no cover - defensive path for runtime robustness
             self.logger.exception("crew flow kickoff failed: %s", exc)
             self._cleanup_release_manager_agents(next_state=state)
@@ -227,7 +267,127 @@ class CrewRuntimeCoordinator:
                 next_step=state.step,
                 next_state=state,
                 audit_reason=f"crew_runtime_error:{exc.__class__.__name__}",
+                flow_lifecycle="error",
             )
+
+    def _flow_kickoff(self, *, inputs: dict[str, Any]) -> CrewDecision:
+        result = self.flow.kickoff(inputs=inputs)
+        return self._coerce_flow_output_to_decision(result=result)
+
+    def resume_from_pending(
+        self,
+        *,
+        flow_id: str,
+        feedback: str,
+        state: WorkflowState,
+    ) -> CrewDecision:
+        normalized_flow_id = flow_id.strip()
+        if not normalized_flow_id:
+            return CrewDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason="resume_failed_no_pending:empty_flow_id",
+                actor="flow_runtime",
+                flow_lifecycle="error",
+            )
+        flow_cls = type(self.flow)
+        from_pending = getattr(flow_cls, "from_pending", None)
+        if not callable(from_pending):
+            return CrewDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason="resume_failed_no_pending:from_pending_unavailable",
+                actor="flow_runtime",
+                flow_lifecycle="error",
+            )
+        try:
+            restored_flow = from_pending(
+                normalized_flow_id,
+                persistence=self._flow_persistence,
+                coordinator=self,
+            )
+            restored_flow.resume(feedback)
+            if self._flow_persistence is not None:
+                clear_method = getattr(self._flow_persistence, "clear_pending_feedback", None)
+                if callable(clear_method):
+                    clear_method(normalized_flow_id)
+            next_state = WorkflowState.from_dict(state.to_dict())
+            next_state.flow_execution_id = normalized_flow_id
+            next_state.flow_paused_at = None
+            next_state.pause_reason = None
+            return CrewDecision(
+                next_step=next_state.step,
+                next_state=next_state,
+                audit_reason="resume_dispatched",
+                actor="flow_runtime",
+                flow_lifecycle="running",
+            )
+        except Exception as exc:  # pragma: no cover - runtime safety
+            self.logger.exception("crew flow resume failed: %s", exc)
+            return CrewDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason=f"resume_failed_no_pending:{exc.__class__.__name__}",
+                actor="flow_runtime",
+                flow_lifecycle="error",
+            )
+
+    def _finalize_flow_metadata(
+        self,
+        *,
+        decision: CrewDecision,
+        previous_state: WorkflowState,
+        action: str,
+    ) -> None:
+        next_state = decision.next_state
+        if action == "kickoff" and not next_state.flow_execution_id:
+            next_state.flow_execution_id = str(uuid.uuid4())
+        if action == "resume" and previous_state.flow_execution_id:
+            next_state.flow_execution_id = previous_state.flow_execution_id
+
+        if decision.flow_lifecycle not in {"paused", "completed"}:
+            decision.flow_lifecycle = "running"
+
+        if next_state.active_release is None and decision.next_step == ReleaseStep.IDLE:
+            next_state.flow_paused_at = None
+            next_state.pause_reason = None
+            if decision.flow_lifecycle != "paused":
+                decision.flow_lifecycle = "completed"
+                next_state.flow_execution_id = None
+
+    def _coerce_flow_output_to_decision(self, *, result: Any) -> CrewDecision:
+        if HumanFeedbackPending is not None and isinstance(result, HumanFeedbackPending):
+            context = getattr(result, "context", None)
+            method_output = getattr(context, "method_output", None)
+            if isinstance(method_output, CrewDecision):
+                paused_decision = method_output
+            else:
+                paused_decision = CrewDecision(
+                    next_step=ReleaseStep.IDLE,
+                    next_state=WorkflowState(),
+                    audit_reason="pending_created_without_decision_payload",
+                    actor="flow_runtime",
+                )
+            flow_id = str(getattr(context, "flow_id", "") or "").strip()
+            if flow_id:
+                paused_decision.next_state.flow_execution_id = flow_id
+            paused_decision.next_state.flow_paused_at = datetime.now(timezone.utc).isoformat()
+            pause_reason = str(getattr(context, "method_name", "") or "human_feedback_pending")
+            paused_decision.next_state.pause_reason = pause_reason
+            paused_decision.flow_lifecycle = "paused"
+            if not paused_decision.audit_reason:
+                paused_decision.audit_reason = "pending_created"
+            return paused_decision
+        if isinstance(result, CrewDecision):
+            return result
+        payload = _extract_structured_payload(result)
+        current = WorkflowState.from_dict(self.flow.state.state if hasattr(self.flow.state, "state") else {})
+        decision = CrewDecision.from_payload(payload, current_state=current)
+        decision.tool_calls = self._resolve_tool_calls(
+            payload=payload,
+            native_tool_calls=extract_native_tool_calls(result),
+        )
+        return decision
 
     def _run_flow_orchestrator_turn(self, *, inputs: dict[str, Any]) -> FlowTurnContext:
         state = WorkflowState.from_dict(inputs.get("state", {}))
@@ -332,6 +492,56 @@ class CrewRuntimeCoordinator:
 
     def handle_step_unknown(self, *, context: FlowTurnContext) -> CrewDecision:
         return self._run_flow_release_manager_turn(context=context)
+
+    def maybe_pause_flow(self, *, flow: Any, decision: CrewDecision, context: FlowTurnContext) -> None:
+        if not _step_requires_human_confirmation(decision.next_step):
+            return
+        if _has_resume_event(context.payload.get("events", [])):
+            return
+        next_state = decision.next_state
+        if not next_state.flow_execution_id:
+            next_state.flow_execution_id = str(uuid.uuid4())
+        next_state.flow_paused_at = datetime.now(timezone.utc).isoformat()
+        next_state.pause_reason = f"awaiting_confirmation:{decision.next_step.value}"
+        decision.flow_lifecycle = "paused"
+        if self._flow_persistence is None:
+            return
+        try:
+            context_payload = PendingFeedbackContext(
+                flow_id=next_state.flow_execution_id,
+                flow_class=f"{flow.__class__.__module__}.{flow.__class__.__name__}",
+                method_name=f"gate_{decision.next_step.value.lower()}",
+                method_output={
+                    "next_step": decision.next_step.value,
+                    "audit_reason": decision.audit_reason,
+                },
+                message=next_state.pause_reason,
+                emit=None,
+                default_outcome=None,
+                metadata={
+                    "pause_reason": next_state.pause_reason,
+                    "release_version": (
+                        next_state.active_release.release_version if next_state.active_release else ""
+                    ),
+                    "step": decision.next_step.value,
+                },
+                llm=None,
+            )
+            state_data: dict[str, Any]
+            if hasattr(flow, "state") and hasattr(flow.state, "model_dump"):
+                state_data = dict(flow.state.model_dump())
+            elif hasattr(flow, "state") and isinstance(flow.state, dict):
+                state_data = dict(flow.state)
+            else:
+                state_data = {}
+            state_data["id"] = next_state.flow_execution_id
+            self._flow_persistence.save_pending_feedback(
+                next_state.flow_execution_id,
+                context_payload,
+                state_data,
+            )
+        except Exception:
+            self.logger.debug("flow pending persistence failed", exc_info=True)
 
     @staticmethod
     def _event_to_dict(event: SlackEvent) -> dict[str, Any]:
@@ -471,6 +681,17 @@ class CrewRuntimeCoordinator:
             self.logger.warning("failed to init CrewAI memory for scope=%s: %s", scope_name, exc)
             return None
 
+    def _build_flow_persistence(self) -> Any | None:
+        if SQLiteFlowPersistence is None:
+            return None
+        try:
+            storage_root = self._memory_storage_root()
+            storage_root.mkdir(parents=True, exist_ok=True)
+            return SQLiteFlowPersistence(db_path=str(storage_root / "flow_pending.db"))
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self.logger.warning("failed to init Flow persistence: %s", exc)
+            return None
+
     def _memory_storage_root(self) -> Path:
         base = Path(self.memory_db_path)
         normalized = base.with_suffix("") if base.suffix else base
@@ -562,3 +783,26 @@ def _step_requires_release_manager(step: ReleaseStep) -> bool:
         ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
         ReleaseStep.READY_FOR_BRANCH_CUT,
     }
+
+
+def _step_requires_human_confirmation(step: ReleaseStep) -> bool:
+    return step in {
+        ReleaseStep.WAIT_START_APPROVAL,
+        ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+        ReleaseStep.WAIT_MEETING_CONFIRMATION,
+        ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+    }
+
+
+def _has_resume_event(events: Any) -> bool:
+    if not isinstance(events, list):
+        return False
+    for event in events:
+        event_type = ""
+        if isinstance(event, dict):
+            event_type = str(event.get("event_type", "")).strip()
+        else:
+            event_type = str(getattr(event, "event_type", "")).strip()
+        if event_type == "approval_confirmed":
+            return True
+    return False

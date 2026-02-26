@@ -5,11 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from src.crew_memory import CrewAIMemory
-from src.crew_runtime import CrewRuntimeCoordinator
+from src.crew_runtime import CrewDecision, CrewRuntimeCoordinator
 from src.policies import PolicyConfig
 from src.release_workflow import ReleaseWorkflow, RuntimeConfig
 from src.tools.slack_tools import SlackGateway
-from src.workflow_state import ReleaseStep, WorkflowState
+from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
 
 def _policy() -> PolicyConfig:
@@ -31,13 +31,12 @@ class _KickoffProbeRuntime:
 
     def kickoff(self, *, state, events, config, now=None, trigger_reason="heartbeat_timer"):  # noqa: ANN001
         self.trigger_reason = trigger_reason
-        return SimpleNamespace(
+        return CrewDecision(
             next_step=state.step,
             next_state=state,
-            state_patch={},
-            tool_calls=[],
             audit_reason="probe",
             actor="orchestrator",
+            flow_lifecycle="running",
         )
 
 
@@ -73,6 +72,44 @@ def test_release_workflow_propagates_trigger_reason_to_runtime(tmp_path: Path) -
 
     assert state.step == ReleaseStep.IDLE
     assert runtime.trigger_reason == "signal_trigger"
+
+
+def test_release_workflow_keeps_paused_state_without_approval_event(tmp_path: Path) -> None:
+    class _PausedRuntime:
+        def kickoff(self, *, state, events, config, now=None, trigger_reason="heartbeat_timer"):  # noqa: ANN001
+            _ = (events, config, now, trigger_reason)
+            return CrewDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason="paused",
+                actor="flow_runtime",
+                flow_lifecycle="paused",
+            )
+
+    config = _runtime_config(tmp_path)
+    memory = CrewAIMemory(db_path=config.memory_db_path)
+    paused_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.104.0",
+            step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
+        ),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_MEETING_CONFIRMATION",
+    )
+    memory.save_state(paused_state, reason="seed")
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
+    workflow = ReleaseWorkflow(
+        config=config,
+        memory=memory,
+        slack_gateway=gateway,
+        crew_runtime=_PausedRuntime(),
+    )
+
+    state = workflow.tick(trigger_reason="heartbeat_timer")
+
+    assert state.is_paused is True
+    assert state.flow_execution_id == "flow-1"
 
 
 def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch, tmp_path: Path) -> None:

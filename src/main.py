@@ -164,7 +164,7 @@ def run_heartbeat(iterations: int = typer.Option(0, help="0 means infinite loop.
                 )
                 continue
 
-            delay_minutes = idle_minutes if state.step == ReleaseStep.IDLE else active_minutes
+            delay_minutes = idle_minutes if state.step == ReleaseStep.IDLE or getattr(state, "is_paused", False) else active_minutes
             delay_seconds = delay_minutes * 60
             slept = 0.0
             while slept < delay_seconds:

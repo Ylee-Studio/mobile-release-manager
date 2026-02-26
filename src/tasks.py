@@ -19,6 +19,7 @@ _TOOL_EXAMPLES = (
 _COMMON_SCHEMA_DEFS = (
     f"Schema definitions:\n"
     f"- ReleaseStep := {_RELEASE_STEP_VALUES}\n"
+    '- FlowLifecycle := "running" | "paused" | "completed"\n'
     '- ToolCall := {"tool":"name","reason":"why","args":{...}}\n'
 )
 _COMMON_FORMAT_RULES = (
@@ -50,10 +51,18 @@ def build_orchestrator_task(agent, slack_tools):
             '  "next_state": { ... WorkflowState dict ... },\n'
             '  "tool_calls": [<ToolCall>],\n'
             '  "audit_reason": "short explanation",\n'
-            '  "invoke_release_manager": true|false\n'
+            '  "invoke_release_manager": true|false,\n'
+            '  "flow_lifecycle": "running|paused|completed"\n'
             "}\n"
             "Behavior requirements:\n"
             "- Orchestrator is responsible for routing and state transitions.\n"
+            "- For human-confirmation stages, keep next_step at WAIT_* and "
+            "flow_lifecycle='paused' until approval_confirmed event arrives.\n"
+            "- Keep state flow metadata consistent: set flow_execution_id for active flow, "
+            "set flow_paused_at/pause_reason only when flow_lifecycle='paused', "
+            "and clear pause fields after resume.\n"
+            "- Resume semantics: approval_confirmed events are processed only after runtime "
+            "restores pending context via from_pending(flow_id).\n"
             "- For release-manager phases (WAIT_MANUAL_RELEASE_CONFIRMATION, "
             "WAIT_MEETING_CONFIRMATION, "
             "WAIT_READINESS_CONFIRMATIONS, "
@@ -68,7 +77,7 @@ def build_orchestrator_task(agent, slack_tools):
             f"{_COMMON_FORMAT_RULES}"
         ),
         expected_output=(
-            "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager."
+            "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager, flow_lifecycle."
         ),
         output_pydantic=AgentDecisionPayload,
         tools=[*slack_tools],
@@ -93,6 +102,10 @@ def build_release_manager_task(agent, slack_tools):
             "\n"
             "Behavior requirements:\n"
             "- Do NOT auto-create Jira releases.\n"
+            "- Return flow_lifecycle='paused' while waiting for human confirmation, "
+            "flow_lifecycle='running' after approval_confirmed transitions, and "
+            "flow_lifecycle='completed' only when flow is truly finished.\n"
+            "- Ensure all confirmation gates are compatible with pending-flow recovery via from_pending(flow_id).\n"
             "- Move from WAIT_START_APPROVAL directly to WAIT_MANUAL_RELEASE_CONFIRMATION and "
             "request release creation confirmation via exactly one slack_approve tool call.\n"
             "- For that transition, do not emit slack_message; the confirmation text in "
@@ -120,15 +133,16 @@ def build_release_manager_task(agent, slack_tools):
             '  "next_step": "<ReleaseStep>",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
             '  "tool_calls": [<ToolCall>],\n'
-            '  "audit_reason": "short explanation"\n'
+            '  "audit_reason": "short explanation",\n'
+            '  "flow_lifecycle": "running|paused|completed"\n'
             "}\n"
             "Use `next_state` as the complete state snapshot for persistence. "
             f"{_COMMON_FORMAT_RULES} "
             "Include all required tool fields. "
-            "If no change is needed, return the same state with matching next_step."
+            "If no change is needed, return the same state with matching next_step and consistent flow_lifecycle."
         ),
         expected_output=(
-            "Valid JSON object with next_step, next_state, tool_calls, audit_reason."
+            "Valid JSON object with next_step, next_state, tool_calls, audit_reason, flow_lifecycle."
         ),
         output_pydantic=AgentDecisionPayload,
         tools=[*slack_tools],

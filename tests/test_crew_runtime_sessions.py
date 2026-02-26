@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.crew_runtime import CrewRuntimeCoordinator
+from src.crew_runtime import CrewDecision, CrewRuntimeCoordinator, FlowTurnContext
 from src.policies import PolicyConfig
-from src.tools.slack_tools import SlackGateway
-from src.workflow_state import ReleaseStep, WorkflowState
+from src.tools.slack_tools import SlackEvent, SlackGateway
+from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
 
 def _policy() -> PolicyConfig:
@@ -21,209 +21,141 @@ def _config() -> SimpleNamespace:
     )
 
 
-def _orchestrator_payload(*, release_version: str | None, invoke_release_manager: bool) -> dict:
-    if release_version:
-        next_step = ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value
-        active_release = {
-            "release_version": release_version,
-            "step": next_step,
-            "message_ts": {},
-            "thread_ts": {},
-            "readiness_map": {"Growth": False},
-        }
-    else:
-        next_step = ReleaseStep.IDLE.value
-        active_release = None
-    return {
-        "next_step": next_step,
-        "next_state": {
-            "active_release": active_release,
-            "previous_release_version": None,
-            "previous_release_completed_at": None,
-            "processed_event_ids": [],
-            "completed_actions": {},
-            "checkpoints": [],
-        },
-        "tool_calls": [],
-        "audit_reason": "orchestrator_decision",
-        "invoke_release_manager": invoke_release_manager,
-    }
-
-
-def _release_manager_payload(release_version: str) -> dict:
-    return {
-        "next_step": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value,
-        "next_state": {
-            "active_release": {
-                "release_version": release_version,
-                "step": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value,
-                "message_ts": {},
-                "thread_ts": {},
-                "readiness_map": {"Growth": False},
-            },
-            "previous_release_version": None,
-            "previous_release_completed_at": None,
-            "processed_event_ids": [],
-            "completed_actions": {},
-            "checkpoints": [],
-        },
-        "tool_calls": [],
-        "audit_reason": "release_manager_decision",
-    }
-
-
-def test_orchestrator_session_created_once_and_reused(monkeypatch, tmp_path) -> None:
-    calls = {"orchestrator_agent": 0, "orchestrator_task": 0}
-
-    def _build_orchestrator_agent(*, policies):  # noqa: ANN001
-        calls["orchestrator_agent"] += 1
-        return object()
-
-    def _build_orchestrator_task(*, agent, slack_tools):  # noqa: ANN001
-        calls["orchestrator_task"] += 1
-        return object()
-
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", _build_orchestrator_agent)
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", _build_orchestrator_task)
-
-    agent_ids: list[int] = []
-
-    def _run_orchestrator(self, *, payload):  # noqa: ANN001
-        agent_ids.append(id(self._orchestrator_agent))
-        return _orchestrator_payload(release_version=None, invoke_release_manager=False), []
-
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_orchestrator", _run_orchestrator)
-
-    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
-    coordinator = CrewRuntimeCoordinator(
-        policy=_policy(),
-        slack_gateway=gateway,
-        memory_db_path=str(tmp_path / "memory.db"),
-    )
-
-    state = WorkflowState()
-    coordinator.kickoff(state=state, events=[], config=_config())
-    coordinator.kickoff(state=state, events=[], config=_config())
-
-    assert calls["orchestrator_agent"] == 1
-    assert calls["orchestrator_task"] == 0
-    assert len(agent_ids) == 2
-    assert agent_ids[0] == agent_ids[1]
-
-
-def test_release_manager_session_reused_per_release(monkeypatch, tmp_path) -> None:
-    calls = {"release_manager_agent": 0, "release_manager_task": 0}
-
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", lambda *, policies: object())
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent, slack_tools: {"task": "orchestrator"})
-
-    def _build_release_manager_agent(*, policies, release_version):  # noqa: ANN001
-        calls["release_manager_agent"] += 1
-        return {"release_version": release_version}
-
-    def _build_release_manager_task(*, agent, slack_tools):  # noqa: ANN001
-        calls["release_manager_task"] += 1
-        return {"task": "release_manager"}
-
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_agent", _build_release_manager_agent)
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_task", _build_release_manager_task)
-
-    def _run_orchestrator(self, *, payload):  # noqa: ANN001
-        return _orchestrator_payload(release_version="5.104.0", invoke_release_manager=True), []
-
-    seen_rm_agents: list[int] = []
-
-    def _run_release_manager(self, *, agent, payload):  # noqa: ANN001
-        seen_rm_agents.append(id(agent))
-        return _release_manager_payload("5.104.0"), []
-
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_orchestrator", _run_orchestrator)
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_release_manager", _run_release_manager)
-
-    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
-    coordinator = CrewRuntimeCoordinator(
-        policy=_policy(),
-        slack_gateway=gateway,
-        memory_db_path=str(tmp_path / "memory.db"),
-    )
-
-    state = WorkflowState()
-    first = coordinator.kickoff(state=state, events=[], config=_config())
-    second = coordinator.kickoff(state=first.next_state, events=[], config=_config())
-
-    assert first.actor == "release_manager"
-    assert second.actor == "release_manager"
-    assert len(seen_rm_agents) == 2
-    assert seen_rm_agents[0] == seen_rm_agents[1]
-    assert calls["release_manager_agent"] == 1
-    assert calls["release_manager_task"] == 0
-
-
-def test_release_manager_sessions_cleared_on_idle_transition(monkeypatch, tmp_path) -> None:
+def _build_coordinator(monkeypatch, tmp_path) -> CrewRuntimeCoordinator:
     monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", lambda *, policies: object())
     monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent, slack_tools: {"task": "orchestrator"})
     monkeypatch.setattr("src.crew_runtime.build_release_manager_agent", lambda *, policies, release_version: object())
     monkeypatch.setattr("src.crew_runtime.build_release_manager_task", lambda *, agent, slack_tools: {"task": "release_manager"})
-
-    run_count = {"value": 0}
-
-    def _run_orchestrator(self, *, payload):  # noqa: ANN001
-        run_count["value"] += 1
-        if run_count["value"] == 1:
-            return _orchestrator_payload(release_version="5.104.0", invoke_release_manager=True), []
-        return _orchestrator_payload(release_version=None, invoke_release_manager=False), []
-
-    def _run_release_manager(self, *, agent, payload):  # noqa: ANN001
-        return _release_manager_payload("5.104.0"), []
-
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_orchestrator", _run_orchestrator)
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_release_manager", _run_release_manager)
-
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
-    coordinator = CrewRuntimeCoordinator(
+    return CrewRuntimeCoordinator(
         policy=_policy(),
         slack_gateway=gateway,
         memory_db_path=str(tmp_path / "memory.db"),
     )
 
-    first = coordinator.kickoff(state=WorkflowState(), events=[], config=_config())
-    assert first.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
-    assert list(coordinator._release_manager_agents.keys()) == ["5.104.0"]
 
-    second = coordinator.kickoff(state=first.next_state, events=[], config=_config())
-    assert second.next_step == ReleaseStep.IDLE
-    assert coordinator._release_manager_agents == {}
+def test_paused_flow_without_confirmation_event_does_not_execute(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    flow_calls = {"kickoff": 0}
+
+    class _FlowStub:
+        def kickoff(self, *, inputs):  # noqa: ANN001
+            flow_calls["kickoff"] += 1
+            return CrewDecision(next_step=ReleaseStep.IDLE, next_state=WorkflowState())
+
+    coordinator.flow = _FlowStub()
+    state = WorkflowState(
+        active_release=ReleaseContext(release_version="5.104.0", step=ReleaseStep.WAIT_MEETING_CONFIRMATION),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_MEETING_CONFIRMATION",
+    )
+    decision = coordinator.kickoff(state=state, events=[], config=_config())
+
+    assert flow_calls["kickoff"] == 0
+    assert decision.flow_lifecycle == "paused"
+    assert decision.audit_reason.startswith("flow_paused_waiting_confirmation:")
 
 
-def test_step_requires_release_manager_even_when_invoke_flag_false(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", lambda *, policies: object())
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent, slack_tools: {"task": "orchestrator"})
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_agent", lambda *, policies, release_version: object())
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_task", lambda *, agent, slack_tools: {"task": "release_manager"})
+def test_paused_flow_with_confirmation_event_runs_kickoff(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    flow_calls = {"kickoff": 0}
 
-    def _run_orchestrator(self, *, payload):  # noqa: ANN001
-        response = _orchestrator_payload(release_version="5.104.0", invoke_release_manager=False)
-        response["next_step"] = ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value
-        response["next_state"]["active_release"]["step"] = ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value
-        return response, []
+    class _FlowStub:
+        def kickoff(self, *, inputs):  # noqa: ANN001
+            _ = inputs
+            flow_calls["kickoff"] += 1
+            return CrewDecision(
+                next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                next_state=WorkflowState(
+                    active_release=ReleaseContext(
+                        release_version="5.104.0",
+                        step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                    )
+                ),
+                flow_lifecycle="running",
+            )
 
-    release_manager_calls = {"count": 0}
-
-    def _run_release_manager(self, *, agent, payload):  # noqa: ANN001
-        release_manager_calls["count"] += 1
-        return _release_manager_payload("5.104.0"), []
-
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_orchestrator", _run_orchestrator)
-    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_release_manager", _run_release_manager)
-
-    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
-    coordinator = CrewRuntimeCoordinator(
-        policy=_policy(),
-        slack_gateway=gateway,
-        memory_db_path=str(tmp_path / "memory.db"),
+    coordinator.flow = _FlowStub()
+    state = WorkflowState(
+        active_release=ReleaseContext(release_version="5.104.0", step=ReleaseStep.WAIT_MEETING_CONFIRMATION),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_MEETING_CONFIRMATION",
+    )
+    decision = coordinator.kickoff(
+        state=state,
+        events=[
+            SlackEvent(
+                event_id="ev-1",
+                event_type="approval_confirmed",
+                channel_id="C_RELEASE",
+            )
+        ],
+        config=_config(),
     )
 
-    decision = coordinator.kickoff(state=WorkflowState(), events=[], config=_config())
+    assert flow_calls["kickoff"] == 1
+    assert decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+    assert decision.flow_lifecycle == "running"
 
-    assert release_manager_calls["count"] == 1
-    assert decision.actor == "release_manager"
+
+def test_maybe_pause_flow_marks_state_and_persists_pending(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+
+    decision = CrewDecision(
+        next_step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+        next_state=WorkflowState(
+            active_release=ReleaseContext(
+                release_version="5.104.0",
+                step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+            )
+        ),
+        flow_lifecycle="running",
+    )
+    ctx = FlowTurnContext(
+        payload={"events": []},
+        current_state=WorkflowState(),
+        orchestrator_payload={},
+        orchestrator_native_calls=[],
+        orchestrator_decision=decision,
+    )
+
+    coordinator.maybe_pause_flow(flow=coordinator.flow, decision=decision, context=ctx)
+
+    assert decision.flow_lifecycle == "paused"
+    assert decision.next_state.flow_execution_id
+    assert decision.next_state.flow_paused_at
+    pending = coordinator._flow_persistence.load_pending_feedback(decision.next_state.flow_execution_id)  # noqa: SLF001
+    assert pending is not None
+
+
+def test_resume_from_pending_uses_from_pending_flow(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    called = {"from_pending": 0, "resume": 0}
+
+    class _RestoredFlow:
+        def resume(self, feedback=""):  # noqa: ANN001
+            _ = feedback
+            called["resume"] += 1
+            return "ok"
+
+    def _from_pending(cls, flow_id, persistence=None, **kwargs):  # noqa: ANN001, ANN003
+        _ = (cls, flow_id, persistence, kwargs)
+        called["from_pending"] += 1
+        return _RestoredFlow()
+
+    monkeypatch.setattr(type(coordinator.flow), "from_pending", classmethod(_from_pending), raising=False)
+    state = WorkflowState(
+        active_release=ReleaseContext(release_version="5.104.0", step=ReleaseStep.WAIT_MEETING_CONFIRMATION),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_MEETING_CONFIRMATION",
+    )
+
+    decision = coordinator.resume_from_pending(flow_id="flow-1", feedback="Подтвердить", state=state)
+
+    assert called["from_pending"] == 1
+    assert called["resume"] == 1
+    assert decision.flow_lifecycle == "running"
+    assert decision.audit_reason == "resume_dispatched"
