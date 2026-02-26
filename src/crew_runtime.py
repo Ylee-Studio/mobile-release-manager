@@ -3,18 +3,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-try:  # pragma: no cover - Memory may differ by crewai version
-    from crewai import Crew, Memory, Process
-except Exception:  # pragma: no cover - fallback for older crewai
-    from crewai import Crew, Process
-
-    Memory = None  # type: ignore[assignment]
+from crewai import Crew, Memory, Process
 
 from .agents import build_orchestrator_agent, build_release_manager_agent
 from .observability import CrewRuntimeCallbacks
@@ -270,6 +266,7 @@ class CrewRuntimeCoordinator:
     ) -> None:
         self.policy = policy
         self.memory_db_path = memory_db_path
+        self._ensure_crewai_storage_dir()
         self.slack_tools = [
             SlackMessageTool(gateway=slack_gateway),
             SlackApproveTool(gateway=slack_gateway),
@@ -675,14 +672,7 @@ class CrewRuntimeCoordinator:
         return validate_and_normalize_tool_calls(source, schema_by_tool=self.tool_args_schema)
 
     def _build_crewai_memory_scope(self, *, scope_name: str) -> Any | None:
-        if Memory is None:
-            return None
-        storage_root = self._memory_storage_root()
-        storage_path = storage_root / scope_name
-        storage_path.mkdir(parents=True, exist_ok=True)
         try:
-            return Memory(storage=str(storage_path))
-        except TypeError:
             return Memory()
         except Exception as exc:  # pragma: no cover - defensive fallback
             self.logger.warning("failed to init CrewAI memory for scope=%s: %s", scope_name, exc)
@@ -703,6 +693,13 @@ class CrewRuntimeCoordinator:
         base = Path(self.memory_db_path)
         normalized = base.with_suffix("") if base.suffix else base
         return normalized.parent / f"{normalized.name}_crew_memory"
+
+    def _ensure_crewai_storage_dir(self) -> None:
+        if os.getenv("CREWAI_STORAGE_DIR"):
+            return
+        storage_root = self._memory_storage_root()
+        storage_root.mkdir(parents=True, exist_ok=True)
+        os.environ["CREWAI_STORAGE_DIR"] = str(storage_root)
 
     @staticmethod
     def _crew_memory_kwargs(*, memory_obj: Any | None) -> dict[str, Any]:

@@ -60,20 +60,40 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfig:
 
 
 @dataclass
-class _InMemoryWorkflowMemory:
-    state: WorkflowState = field(default_factory=WorkflowState)
+class _MemoryRecord:
+    content: str
+    metadata: dict
 
-    def load_state(self) -> WorkflowState:
-        return WorkflowState.from_dict(self.state.to_dict())
 
-    def save_state(self, state: WorkflowState, *, reason: str) -> None:
-        _ = reason
-        self.state = WorkflowState.from_dict(state.to_dict())
+@dataclass
+class _MemoryMatch:
+    record: _MemoryRecord
+
+
+@dataclass
+class _InMemoryNativeMemory:
+    entries: list[dict] = field(default_factory=list)
+
+    def remember(self, *, content: str, metadata: dict, **_: object) -> None:
+        self.entries.append({"content": content, "metadata": metadata})
+
+    def recall(self, **_: object) -> list[_MemoryMatch]:
+        return [
+            _MemoryMatch(record=_MemoryRecord(content=entry["content"], metadata=entry["metadata"]))
+            for entry in reversed(self.entries)
+        ]
+
+
+def _seed_state(memory: _InMemoryNativeMemory, state: WorkflowState, *, reason: str = "seed") -> None:
+    memory.remember(
+        content="{}",
+        metadata={"state": state.to_dict(), "reason": reason},
+    )
 
 
 def test_release_workflow_propagates_trigger_reason_to_runtime(tmp_path: Path) -> None:
     config = _runtime_config(tmp_path)
-    memory = _InMemoryWorkflowMemory()
+    memory = _InMemoryNativeMemory()
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
     runtime = _KickoffProbeRuntime()
     workflow = ReleaseWorkflow(
@@ -102,7 +122,7 @@ def test_release_workflow_keeps_paused_state_without_approval_event(tmp_path: Pa
             )
 
     config = _runtime_config(tmp_path)
-    memory = _InMemoryWorkflowMemory()
+    memory = _InMemoryNativeMemory()
     paused_state = WorkflowState(
         active_release=ReleaseContext(
             release_version="5.104.0",
@@ -112,7 +132,7 @@ def test_release_workflow_keeps_paused_state_without_approval_event(tmp_path: Pa
         flow_paused_at="2026-01-01T00:00:00+00:00",
         pause_reason="awaiting_confirmation:WAIT_MEETING_CONFIRMATION",
     )
-    memory.save_state(paused_state, reason="seed")
+    _seed_state(memory, paused_state)
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
     workflow = ReleaseWorkflow(
         config=config,

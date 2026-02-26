@@ -37,15 +37,28 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfig:
 
 
 @dataclass
-class _InMemoryWorkflowMemory:
-    state: WorkflowState = field(default_factory=WorkflowState)
+class _MemoryRecord:
+    content: str
+    metadata: dict
 
-    def load_state(self) -> WorkflowState:
-        return WorkflowState.from_dict(self.state.to_dict())
 
-    def save_state(self, state: WorkflowState, *, reason: str) -> None:
-        _ = reason
-        self.state = WorkflowState.from_dict(state.to_dict())
+@dataclass
+class _MemoryMatch:
+    record: _MemoryRecord
+
+
+@dataclass
+class _InMemoryNativeMemory:
+    entries: list[dict] = field(default_factory=list)
+
+    def remember(self, *, content: str, metadata: dict, **_: object) -> None:
+        self.entries.append({"content": content, "metadata": metadata})
+
+    def recall(self, **_: object) -> list[_MemoryMatch]:
+        return [
+            _MemoryMatch(record=_MemoryRecord(content=entry["content"], metadata=entry["metadata"]))
+            for entry in reversed(self.entries)
+        ]
 
 
 class _FailIfCalledCrewRuntime:
@@ -56,23 +69,21 @@ class _FailIfCalledCrewRuntime:
         raise AssertionError(f"resume_from_pending must not be called in readiness gate: {kwargs}")
 
 
-def _seed_wait_readiness_state(memory: _InMemoryWorkflowMemory) -> None:
-    memory.save_state(
-        WorkflowState(
-            active_release=ReleaseContext(
-                release_version="5.104.0",
-                step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
-                slack_channel_id="C_RELEASE",
-                message_ts={"generic_message": "177.700"},
-                thread_ts={"generic_message": "177.700"},
-                readiness_map={},
-            ),
-            flow_execution_id="flow-readiness-1",
-            flow_paused_at="2026-02-27T10:00:00+00:00",
-            pause_reason="awaiting_confirmation:WAIT_READINESS_CONFIRMATIONS",
+def _seed_wait_readiness_state(memory: _InMemoryNativeMemory) -> None:
+    seeded_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.104.0",
+            step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+            slack_channel_id="C_RELEASE",
+            message_ts={"generic_message": "177.700"},
+            thread_ts={"generic_message": "177.700"},
+            readiness_map={},
         ),
-        reason="seed_wait_readiness",
+        flow_execution_id="flow-readiness-1",
+        flow_paused_at="2026-02-27T10:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_READINESS_CONFIRMATIONS",
     )
+    memory.remember(content="{}", metadata={"state": seeded_state.to_dict(), "reason": "seed_wait_readiness"})
 
 
 def _append_event(path: Path, payload: dict) -> None:
@@ -97,7 +108,7 @@ def _message_event(*, event_id: str, text: str, user_id: str = "U99999999") -> d
 
 def _build_workflow(tmp_path: Path) -> tuple[ReleaseWorkflow, Path]:
     cfg = _runtime_config(tmp_path)
-    memory = _InMemoryWorkflowMemory()
+    memory = _InMemoryNativeMemory()
     _seed_wait_readiness_state(memory)
     gateway = SlackGateway(bot_token=cfg.slack_bot_token, events_path=Path(cfg.slack_events_path))
     workflow = ReleaseWorkflow(

@@ -89,20 +89,33 @@ class _PauseResumeRuntime:
 
 
 @dataclass
-class _InMemoryWorkflowMemory:
-    state: WorkflowState = field(default_factory=WorkflowState)
+class _MemoryRecord:
+    content: str
+    metadata: dict
 
-    def load_state(self) -> WorkflowState:
-        return WorkflowState.from_dict(self.state.to_dict())
 
-    def save_state(self, state: WorkflowState, *, reason: str) -> None:
-        _ = reason
-        self.state = WorkflowState.from_dict(state.to_dict())
+@dataclass
+class _MemoryMatch:
+    record: _MemoryRecord
+
+
+@dataclass
+class _InMemoryNativeMemory:
+    entries: list[dict] = field(default_factory=list)
+
+    def remember(self, *, content: str, metadata: dict, **_: object) -> None:
+        self.entries.append({"content": content, "metadata": metadata})
+
+    def recall(self, **_: object) -> list[_MemoryMatch]:
+        return [
+            _MemoryMatch(record=_MemoryRecord(content=entry["content"], metadata=entry["metadata"]))
+            for entry in reversed(self.entries)
+        ]
 
 
 def _build_workflow(tmp_path: Path) -> ReleaseWorkflow:
     cfg = _runtime_config(tmp_path)
-    memory = _InMemoryWorkflowMemory()
+    memory = _InMemoryNativeMemory()
     gateway = SlackGateway(bot_token=cfg.slack_bot_token, events_path=Path(cfg.slack_events_path))
     runtime = _PauseResumeRuntime()
     return ReleaseWorkflow(

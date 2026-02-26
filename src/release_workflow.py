@@ -8,8 +8,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import quote
+
+from crewai import Memory
 
 from .crew_runtime import CrewDecision, CrewRuntimeCoordinator
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
@@ -38,9 +40,10 @@ class RuntimeConfig:
     agent_pid_path: str
 
 
-class WorkflowMemory(Protocol):
-    def load_state(self) -> WorkflowState: ...
-    def save_state(self, state: WorkflowState, *, reason: str) -> None: ...
+WORKFLOW_STATE_KEY = "release_workflow_state"
+WORKFLOW_MEMORY_SCOPE = "/workflow/state"
+WORKFLOW_MEMORY_SOURCE = "release_workflow"
+WORKFLOW_MEMORY_CATEGORY = "workflow_state"
 
 
 class ReleaseWorkflow:
@@ -50,7 +53,7 @@ class ReleaseWorkflow:
         self,
         *,
         config: RuntimeConfig,
-        memory: WorkflowMemory,
+        memory: Memory,
         slack_gateway: SlackGateway,
         crew_runtime: CrewRuntimeCoordinator | Any,
     ):
@@ -61,7 +64,7 @@ class ReleaseWorkflow:
         self.audit_log_path = Path(config.audit_log_path)
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("release_workflow")
-        self._state = self.memory.load_state()
+        self._state = _load_state_from_memory(self.memory)
 
     def tick(
         self,
@@ -102,7 +105,7 @@ class ReleaseWorkflow:
             )
         self._execute_tool_calls(decision=decision, events=events)
         next_state = decision.next_state
-        self.memory.save_state(next_state, reason=decision.audit_reason)
+        _save_state_to_memory(self.memory, next_state, reason=decision.audit_reason)
         self._state = WorkflowState.from_dict(next_state.to_dict())
         self._append_audit(
             trace_id=trace_id,
@@ -577,6 +580,94 @@ class ReleaseWorkflow:
                 "at": datetime.now(timezone.utc).isoformat(),
             }
         )
+
+
+def _load_state_from_memory(memory: Memory) -> WorkflowState:
+    try:
+        matches = memory.recall(
+            query=WORKFLOW_STATE_KEY,
+            scope=WORKFLOW_MEMORY_SCOPE,
+            categories=[WORKFLOW_MEMORY_CATEGORY],
+            limit=100,
+            depth="shallow",
+            source=WORKFLOW_MEMORY_SOURCE,
+        )
+    except Exception:
+        return WorkflowState()
+
+    if not isinstance(matches, list):
+        return WorkflowState()
+
+    for match in matches:
+        record = getattr(match, "record", None)
+        if record is None and isinstance(match, dict):
+            entry = match
+        else:
+            entry = {
+                "content": getattr(record, "content", ""),
+                "metadata": getattr(record, "metadata", {}),
+            }
+        raw_state = _extract_workflow_state(entry)
+        if isinstance(raw_state, dict):
+            return WorkflowState.from_dict(raw_state)
+    return WorkflowState()
+
+
+def _save_state_to_memory(memory: Memory, state: WorkflowState, *, reason: str) -> None:
+    state_payload = state.to_dict()
+    metadata: dict[str, Any] = {
+        "state_key": WORKFLOW_STATE_KEY,
+        "state": state_payload,
+        "reason": reason,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    content = json.dumps(state_payload, ensure_ascii=True)
+    try:
+        memory.remember(
+            content=content,
+            scope=WORKFLOW_MEMORY_SCOPE,
+            categories=[WORKFLOW_MEMORY_CATEGORY],
+            metadata=metadata,
+            importance=1.0,
+            source=WORKFLOW_MEMORY_SOURCE,
+        )
+    except Exception:
+        return
+
+
+def _extract_workflow_state(entry: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        state = metadata.get("state")
+        if isinstance(state, dict):
+            return state
+        if isinstance(state, str):
+            try:
+                parsed = json.loads(state)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(parsed, dict):
+                return parsed
+
+    state = entry.get("state")
+    if isinstance(state, dict):
+        return state
+    content = entry.get("content")
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    if isinstance(state, str):
+        try:
+            parsed = json.loads(state)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _event_to_dict(event: Any) -> dict[str, Any]:

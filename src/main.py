@@ -7,6 +7,7 @@ import signal
 import time
 from pathlib import Path
 
+from crewai import Memory
 import typer
 from rich.console import Console
 
@@ -16,7 +17,6 @@ from .policies import PolicyConfig
 from .release_workflow import ReleaseWorkflow
 from .slack_ingress import build_ingress_config, run_slack_ingress
 from .tools.slack_tools import SlackGateway
-from .workflow_memory import CrewAIWorkflowMemory
 from .workflow_state import ReleaseStep
 
 app = typer.Typer(help="Coordinate release train workflow up to READY_FOR_BRANCH_CUT.")
@@ -40,8 +40,7 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
         bot_token=runtime.slack_bot_token,
         events_path=Path(runtime.slack_events_path),
     )
-    memory_root = _workflow_memory_root(runtime.memory_db_path)
-    memory = CrewAIWorkflowMemory(storage_path=str(memory_root))
+    memory = Memory()
     crew_runtime = CrewRuntimeCoordinator(
         policy=policy,
         slack_gateway=slack_gateway,
@@ -59,14 +58,6 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
         runtime.heartbeat_idle_minutes,
         Path(runtime.agent_pid_path),
     )
-
-
-def _workflow_memory_root(memory_db_path: str) -> Path:
-    base = Path(memory_db_path)
-    normalized = base.with_suffix("") if base.suffix else base
-    return normalized.parent / f"{normalized.name}_workflow_memory"
-
-
 def _pending_events_count(workflow: ReleaseWorkflow) -> int | None:
     gateway = getattr(workflow, "slack_gateway", None)
     counter = getattr(gateway, "pending_events_count", None)
