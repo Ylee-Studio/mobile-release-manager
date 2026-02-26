@@ -57,6 +57,7 @@ class ReleaseWorkflow:
         self.audit_log_path = Path(config.audit_log_path)
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("release_workflow")
+        self._state = self.memory.load_state()
 
     def tick(
         self,
@@ -64,7 +65,7 @@ class ReleaseWorkflow:
         now: datetime | None = None,
         trigger_reason: str = "heartbeat_timer",
     ) -> WorkflowState:
-        state = self.memory.load_state()
+        state = WorkflowState.from_dict(self._state.to_dict())
         previous_state = WorkflowState.from_dict(state.to_dict())
         events = self.slack_gateway.poll_events()
         queue_remaining = self.slack_gateway.pending_events_count()
@@ -94,9 +95,15 @@ class ReleaseWorkflow:
                 actor=decision.actor,
                 tool_calls=[],
             )
+        self._prune_completed_actions_on_user_transition(
+            previous_state=previous_state,
+            decision=decision,
+            events=events,
+        )
         self._execute_tool_calls(decision=decision, events=events)
         next_state = decision.next_state
         self.memory.save_state(next_state, reason=decision.audit_reason)
+        self._state = WorkflowState.from_dict(next_state.to_dict())
         self._append_audit(
             trace_id=trace_id,
             previous_state=previous_state,
@@ -146,6 +153,59 @@ class ReleaseWorkflow:
             decision.audit_reason,
             len(events),
             incoming_slack_messages,
+        )
+
+    def _prune_completed_actions_on_user_transition(
+        self,
+        *,
+        previous_state: WorkflowState,
+        decision: CrewDecision,
+        events: list[Any],
+    ) -> None:
+        if not _is_user_initiated_transition(events):
+            return
+        if decision.next_step == previous_state.step:
+            return
+
+        target_order = _step_order(decision.next_step)
+        if target_order is None:
+            return
+
+        removed_keys: list[str] = []
+        for action_key in list(decision.next_state.completed_actions):
+            action_step = _action_step(action_key)
+            if action_step is None:
+                continue
+            action_order = _step_order(action_step)
+            if action_order is None:
+                continue
+            # For manual user transitions, rebuild idempotency from the target step.
+            if action_order < target_order:
+                continue
+            decision.next_state.completed_actions.pop(action_key, None)
+            removed_keys.append(action_key)
+
+        if not removed_keys:
+            return
+        decision.next_state.checkpoints.append(
+            {
+                "phase": "before",
+                "tool": "state_cleanup",
+                "release_version": (
+                    decision.next_state.active_release.release_version
+                    if decision.next_state.active_release
+                    else ""
+                ),
+                "step": decision.next_step.value,
+                "removed_completed_actions": sorted(removed_keys),
+                "reason": "user_initiated_state_transition",
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        self.logger.info(
+            "pruned completed_actions on user transition to %s: %s",
+            decision.next_step.value,
+            sorted(removed_keys),
         )
 
     def _execute_tool_calls(self, *, decision: CrewDecision, events: list[Any]) -> None:
@@ -455,5 +515,68 @@ def _extract_latest_message_thread_ts(events: list[Any]) -> str:
         if message_ts:
             return message_ts
     return ""
+
+
+_STEP_SEQUENCE: tuple[ReleaseStep, ...] = (
+    ReleaseStep.IDLE,
+    ReleaseStep.WAIT_START_APPROVAL,
+    ReleaseStep.RELEASE_MANAGER_CREATED,
+    ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+    ReleaseStep.JIRA_RELEASE_CREATED,
+    ReleaseStep.WAIT_MEETING_CONFIRMATION,
+    ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+    ReleaseStep.READY_FOR_BRANCH_CUT,
+)
+
+_USER_EVENT_SOURCES: set[str] = {"slash_command", "events_api", "interactivity"}
+
+_ACTION_PREFIX_TO_STEP: tuple[tuple[str, ReleaseStep], ...] = (
+    ("start-approval:", ReleaseStep.WAIT_START_APPROVAL),
+    ("start_approval_request", ReleaseStep.WAIT_START_APPROVAL),
+    ("start_approval_confirmation", ReleaseStep.RELEASE_MANAGER_CREATED),
+    ("release_manager_created", ReleaseStep.RELEASE_MANAGER_CREATED),
+    ("create_crossspace_release", ReleaseStep.RELEASE_MANAGER_CREATED),
+    ("manual-release-confirmation-request:", ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION),
+    ("manual_release_confirmation", ReleaseStep.JIRA_RELEASE_CREATED),
+    ("manual-release-instruction:", ReleaseStep.JIRA_RELEASE_CREATED),
+    ("approval-confirmed-update:", ReleaseStep.JIRA_RELEASE_CREATED),
+    ("manual_set_idle", ReleaseStep.IDLE),
+    ("ack_manual_set_idle_message", ReleaseStep.IDLE),
+)
+
+
+def _step_order(step: ReleaseStep) -> int | None:
+    try:
+        return _STEP_SEQUENCE.index(step)
+    except ValueError:
+        return None
+
+
+def _is_user_initiated_transition(events: list[Any]) -> bool:
+    for event in events:
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            continue
+        source = str(metadata.get("source", "")).strip()
+        if source in _USER_EVENT_SOURCES:
+            return True
+    return False
+
+
+def _action_step(action_key: str) -> ReleaseStep | None:
+    normalized = action_key.strip()
+    if not normalized:
+        return None
+    for prefix, step in _ACTION_PREFIX_TO_STEP:
+        if normalized.startswith(prefix):
+            return step
+
+    if normalized.startswith("slack-message:"):
+        maybe_step = normalized.rsplit(":", 1)[-1].strip()
+        try:
+            return ReleaseStep(maybe_step)
+        except ValueError:
+            return None
+    return None
 
 

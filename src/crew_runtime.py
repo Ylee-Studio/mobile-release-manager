@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-
-from crewai import Crew, Process
-from crewai.memory.long_term.long_term_memory import LTMSQLiteStorage, LongTermMemory
 
 from .agents import build_orchestrator_agent, build_release_manager_agent
 from .policies import PolicyConfig
@@ -89,7 +87,10 @@ class CrewRuntimeCoordinator:
             SlackApproveTool(gateway=slack_gateway),
             SlackUpdateTool(gateway=slack_gateway),
         ]
+        self.logger = logging.getLogger("crew_runtime")
         self.tool_args_schema = {tool.name: tool.args_schema for tool in self.slack_tools}
+        self._orchestrator_agent = build_orchestrator_agent(policies=self.policy)
+        self._release_manager_agents: dict[str, Any] = {}
 
     def decide(
         self,
@@ -112,16 +113,7 @@ class CrewRuntimeCoordinator:
         }
 
         try:
-            orchestrator_agent = build_orchestrator_agent(policies=self.policy)
-            orchestrator_task = build_orchestrator_task(
-                agent=orchestrator_agent,
-                slack_tools=self.slack_tools,
-            )
-            orchestrator_payload, orchestrator_native_calls = self._run_crew(
-                agent=orchestrator_agent,
-                task=orchestrator_task,
-                payload=payload,
-            )
+            orchestrator_payload, orchestrator_native_calls = self._run_orchestrator(payload=payload)
             orchestrator_decision = CrewDecision.from_payload(
                 orchestrator_payload,
                 current_state=state,
@@ -140,19 +132,12 @@ class CrewRuntimeCoordinator:
             )
 
             if not invoke_release_manager or not release_version:
+                self._cleanup_release_manager_agents(next_state=orchestrator_decision.next_state)
                 return orchestrator_decision
 
-            release_manager_agent = build_release_manager_agent(
-                policies=self.policy,
-                release_version=release_version,
-            )
-            release_manager_task = build_release_manager_task(
+            release_manager_agent = self._get_or_create_release_manager_agent(release_version=release_version)
+            release_manager_payload, release_manager_native_calls = self._run_release_manager(
                 agent=release_manager_agent,
-                slack_tools=self.slack_tools,
-            )
-            release_manager_payload, release_manager_native_calls = self._run_crew(
-                agent=release_manager_agent,
-                task=release_manager_task,
                 payload={
                     **payload,
                     "state": orchestrator_decision.next_state.to_dict(),
@@ -174,8 +159,11 @@ class CrewRuntimeCoordinator:
             release_manager_decision.audit_reason = (
                 f"{orchestrator_decision.audit_reason};{release_manager_decision.audit_reason}"
             )
+            self._cleanup_release_manager_agents(next_state=release_manager_decision.next_state)
             return release_manager_decision
         except Exception as exc:  # pragma: no cover - defensive path for runtime robustness
+            self.logger.exception("crew runtime decide failed: %s", exc)
+            self._cleanup_release_manager_agents(next_state=state)
             return CrewDecision(
                 next_step=state.step,
                 next_state=state,
@@ -194,18 +182,62 @@ class CrewRuntimeCoordinator:
             "metadata": event.metadata,
         }
 
-    def _run_crew(self, *, agent: Any, task: Any, payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        crew = Crew(
-            agents=[agent],
-            tasks=[task],
-            process=Process.sequential,
-            verbose=True,
-            memory=True,
-            long_term_memory=LongTermMemory(
-                storage=LTMSQLiteStorage(db_path=self.memory_db_path, verbose=False)
-            ),
+    def _run_orchestrator(self, *, payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        orchestrator_task = build_orchestrator_task(
+            agent=self._orchestrator_agent,
+            slack_tools=self.slack_tools,
         )
-        result = crew.kickoff(inputs=payload)
+        orchestrator_task.interpolate_inputs_and_add_conversation_history(payload)
+        result = self._orchestrator_agent.execute_task(
+            task=orchestrator_task,
+            tools=self.slack_tools,
+        )
+        return _extract_payload(result), extract_native_tool_calls(result)
+
+    def _get_or_create_release_manager_agent(self, *, release_version: str) -> Any:
+        key = release_version.strip()
+        if key in self._release_manager_agents:
+            return self._release_manager_agents[key]
+
+        release_manager_agent = build_release_manager_agent(
+            policies=self.policy,
+            release_version=key,
+        )
+        self._release_manager_agents[key] = release_manager_agent
+        return release_manager_agent
+
+    def _cleanup_release_manager_agents(self, *, next_state: WorkflowState) -> None:
+        active_release = next_state.active_release
+        if active_release is None:
+            self._release_manager_agents.clear()
+            return
+
+        active_version = active_release.release_version.strip()
+        if not active_version:
+            self._release_manager_agents.clear()
+            return
+
+        stale_versions = [
+            version for version in self._release_manager_agents.keys() if version != active_version
+        ]
+        for version in stale_versions:
+            self._release_manager_agents.pop(version, None)
+
+    def _run_release_manager(
+        self,
+        *,
+        agent: Any,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        task = build_release_manager_task(
+            agent=agent,
+            slack_tools=self.slack_tools,
+        )
+        task.interpolate_inputs_and_add_conversation_history(payload)
+        result = agent.execute_task(
+            task=task,
+            tools=self.slack_tools,
+        )
         return _extract_payload(result), extract_native_tool_calls(result)
 
     def _resolve_tool_calls(

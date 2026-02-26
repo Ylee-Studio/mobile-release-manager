@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from src.crew_memory import SQLiteMemory
@@ -511,5 +512,248 @@ def test_runtime_failfast_on_slack_message_without_args_text(tmp_path: Path, mon
     assert state.step == previous_state.step
     assert persisted_state.step == previous_state.step
     assert audit_rows[-1]["audit_reason"].startswith("invalid_tool_call:")
+
+
+class CountingMemory:
+    def __init__(self, state: WorkflowState | None = None) -> None:
+        self._state = WorkflowState.from_dict((state or WorkflowState()).to_dict())
+        self.load_count = 0
+
+    def load_state(self) -> WorkflowState:
+        self.load_count += 1
+        return WorkflowState.from_dict(self._state.to_dict())
+
+    def save_state(self, state: WorkflowState, *, reason: str) -> None:  # noqa: ARG002
+        self._state = WorkflowState.from_dict(state.to_dict())
+
+
+class NoopCrewRuntime:
+    def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
+        return CrewDecision(
+            next_step=state.step,
+            next_state=state,
+            audit_reason="noop",
+        )
+
+
+def _runtime_config(tmp_path: Path) -> RuntimeConfig:
+    return RuntimeConfig(
+        slack_channel_id="C_RELEASE",
+        slack_bot_token="xoxb-test-token",
+        timezone="Europe/Moscow",
+        heartbeat_active_minutes=15,
+        heartbeat_idle_minutes=240,
+        jira_project_keys=["IOS"],
+        readiness_owners={"Growth": "owner"},
+        memory_db_path=str(tmp_path / "crewai_memory.db"),
+        audit_log_path=str(tmp_path / "workflow_audit.jsonl"),
+        slack_events_path=str(tmp_path / "slack_events.jsonl"),
+        agent_pid_path=str(tmp_path / "agent.pid"),
+    )
+
+
+def _state_with_release(version: str, previous: str | None = None) -> WorkflowState:
+    return WorkflowState(
+        active_release=ReleaseContext(
+            release_version=version,
+            step=ReleaseStep.WAIT_START_APPROVAL,
+            slack_channel_id="C_RELEASE",
+        ),
+        previous_release_version=previous,
+        previous_release_completed_at=None,
+        processed_event_ids=[f"event-{version}"],
+        completed_actions={},
+        checkpoints=[],
+    )
+
+
+def test_workflow_loads_state_only_once_per_process(tmp_path: Path) -> None:
+    config = _runtime_config(tmp_path)
+    memory = CountingMemory()
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
+    workflow = ReleaseWorkflow(
+        config=config,
+        memory=memory,
+        slack_gateway=slack_gateway,
+        crew_runtime=NoopCrewRuntime(),
+    )
+
+    workflow.tick()
+    workflow.tick()
+
+    assert memory.load_count == 1
+
+
+def test_sqlite_memory_keeps_latest_snapshot_per_release_and_last_two_releases(tmp_path: Path) -> None:
+    memory_db = tmp_path / "crewai_memory.db"
+    memory = SQLiteMemory(db_path=str(memory_db))
+
+    release_100 = _state_with_release("1.0.0")
+    memory.save_state(release_100, reason="first")
+
+    release_100_updated = _state_with_release("1.0.0")
+    release_100_updated.processed_event_ids = ["event-1.0.0", "event-1.0.0-updated"]
+    memory.save_state(release_100_updated, reason="first-updated")
+
+    release_110 = _state_with_release("1.1.0", previous="1.0.0")
+    memory.save_state(release_110, reason="second")
+
+    release_120 = _state_with_release("1.2.0", previous="1.1.0")
+    memory.save_state(release_120, reason="third")
+
+    with sqlite3.connect(memory_db) as connection:
+        rows = connection.execute(
+            "SELECT snapshot_key, state_json FROM workflow_state_snapshots ORDER BY snapshot_key"
+        ).fetchall()
+
+    keys = [row[0] for row in rows]
+    assert keys == ["1.1.0", "1.2.0"]
+    parsed = {row[0]: json.loads(row[1]) for row in rows}
+    assert parsed["1.2.0"]["active_release"]["release_version"] == "1.2.0"
+    assert parsed["1.1.0"]["active_release"]["release_version"] == "1.1.0"
+
+
+def test_manual_transition_prunes_future_actions_and_replays_start_approval(tmp_path: Path, monkeypatch) -> None:
+    class ReenterStartApprovalCrewRuntime:
+        def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
+            if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
+                return CrewDecision(
+                    next_step=ReleaseStep.WAIT_START_APPROVAL,
+                    next_state=WorkflowState(
+                        active_release=ReleaseContext(
+                            release_version="5.104.0",
+                            step=ReleaseStep.WAIT_START_APPROVAL,
+                            slack_channel_id="C0AGLKF6KHD",
+                        ),
+                        previous_release_version=state.previous_release_version,
+                        previous_release_completed_at=state.previous_release_completed_at,
+                        processed_event_ids=[*state.processed_event_ids, "ev-manual-start"],
+                        completed_actions=dict(state.completed_actions),
+                        checkpoints=list(state.checkpoints),
+                    ),
+                    audit_reason="manual_start_reentered",
+                    tool_calls=[
+                        {
+                            "tool": "slack_approve",
+                            "reason": "request fresh approval after manual transition",
+                            "args": {
+                                "channel_id": "C0AGLKF6KHD",
+                                "text": "Подтвердите старт релиза 5.104.0.",
+                                "approve_label": "Подтвердить запуск",
+                            },
+                        }
+                    ],
+                )
+            return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
+
+    sent: list[tuple[str, str, str]] = []
+
+    def _fake_send_approve(channel_id: str, text: str, approve_label: str) -> dict[str, str]:
+        sent.append((channel_id, text, approve_label))
+        return {"message_ts": "1772140000.123456"}
+
+    config = _runtime_config(tmp_path)
+    memory = SQLiteMemory(db_path=config.memory_db_path)
+    stale_state = WorkflowState(
+        active_release=None,
+        previous_release_version="5.104.0",
+        previous_release_completed_at=None,
+        processed_event_ids=["ev-old"],
+        completed_actions={
+            "start-approval:5.104.0": "stale",
+            "manual-release-instruction:5.104.0": "stale",
+        },
+        checkpoints=[],
+    )
+    memory.save_state(stale_state, reason="seed_stale_actions")
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
+    monkeypatch.setattr(slack_gateway, "send_approve", _fake_send_approve)
+    workflow = ReleaseWorkflow(
+        config=config,
+        memory=memory,
+        slack_gateway=slack_gateway,
+        crew_runtime=ReenterStartApprovalCrewRuntime(),
+    )
+
+    _append_event(
+        Path(config.slack_events_path),
+        {
+            "event_id": "ev-manual-start",
+            "event_type": "manual_start",
+            "channel_id": "C0AGLKF6KHD",
+            "text": "5.104.0",
+            "metadata": {"source": "slash_command", "user_id": "U1"},
+        },
+    )
+    state = workflow.tick()
+
+    assert len(sent) == 1
+    assert state.active_release is not None
+    assert state.active_release.step == ReleaseStep.WAIT_START_APPROVAL
+    assert "manual-release-instruction:5.104.0" not in state.completed_actions
+    assert "start-approval:5.104.0" in state.completed_actions
+    cleanup_checkpoints = [cp for cp in state.checkpoints if cp.get("tool") == "state_cleanup"]
+    assert cleanup_checkpoints
+    assert "start-approval:5.104.0" in cleanup_checkpoints[-1]["removed_completed_actions"]
+
+
+def test_non_user_transition_does_not_prune_completed_actions(tmp_path: Path) -> None:
+    class AutoAdvanceCrewRuntime:
+        def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
+            active = state.active_release
+            assert active is not None
+            return CrewDecision(
+                next_step=ReleaseStep.JIRA_RELEASE_CREATED,
+                next_state=WorkflowState(
+                    active_release=ReleaseContext(
+                        release_version=active.release_version,
+                        step=ReleaseStep.JIRA_RELEASE_CREATED,
+                        slack_channel_id=active.slack_channel_id,
+                        message_ts=dict(active.message_ts),
+                        thread_ts=dict(active.thread_ts),
+                        readiness_map=dict(active.readiness_map),
+                    ),
+                    previous_release_version=state.previous_release_version,
+                    previous_release_completed_at=state.previous_release_completed_at,
+                    processed_event_ids=list(state.processed_event_ids),
+                    completed_actions=dict(state.completed_actions),
+                    checkpoints=list(state.checkpoints),
+                ),
+                audit_reason="auto_advance_without_user_event",
+            )
+
+    config = _runtime_config(tmp_path)
+    memory = SQLiteMemory(db_path=config.memory_db_path)
+    seeded_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.104.0",
+            step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+            slack_channel_id="C0AGLKF6KHD",
+        ),
+        previous_release_version="5.104.0",
+        previous_release_completed_at=None,
+        processed_event_ids=["ev-1"],
+        completed_actions={
+            "manual-release-instruction:5.104.0": "done",
+            "approval-confirmed-update:5.104.0:1772140000.123456": "done",
+        },
+        checkpoints=[],
+    )
+    memory.save_state(seeded_state, reason="seed_without_user_event")
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
+    workflow = ReleaseWorkflow(
+        config=config,
+        memory=memory,
+        slack_gateway=slack_gateway,
+        crew_runtime=AutoAdvanceCrewRuntime(),
+    )
+
+    state = workflow.tick()
+
+    assert state.step == ReleaseStep.JIRA_RELEASE_CREATED
+    assert "manual-release-instruction:5.104.0" in state.completed_actions
+    assert "approval-confirmed-update:5.104.0:1772140000.123456" in state.completed_actions
+    cleanup_checkpoints = [cp for cp in state.checkpoints if cp.get("tool") == "state_cleanup"]
+    assert cleanup_checkpoints == []
 
 
