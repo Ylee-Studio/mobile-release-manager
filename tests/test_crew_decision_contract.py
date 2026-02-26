@@ -49,11 +49,11 @@ def test_decision_supports_state_patch_merge() -> None:
 
 def test_decision_keeps_two_agent_contract_fields() -> None:
     payload = {
-        "next_step": "RELEASE_MANAGER_CREATED",
+        "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
         "next_state": {
             "active_release": {
                 "release_version": "3.1.0",
-                "step": "RELEASE_MANAGER_CREATED",
+                "step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
                 "message_ts": {},
                 "thread_ts": {},
                 "readiness_map": {"Core": False},
@@ -69,7 +69,7 @@ def test_decision_keeps_two_agent_contract_fields() -> None:
 
     decision = CrewDecision.from_payload(payload, current_state=WorkflowState(), actor="orchestrator")
     assert decision.actor == "orchestrator"
-    assert decision.next_step == ReleaseStep.RELEASE_MANAGER_CREATED
+    assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "3.1.0"
 

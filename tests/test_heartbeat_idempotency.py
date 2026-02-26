@@ -3,7 +3,7 @@ from pathlib import Path
 
 from src.crew_memory import CrewAIMemory
 from src.crew_runtime import CrewDecision
-from src.release_workflow import MANUAL_RELEASE_MESSAGE, ReleaseWorkflow, RuntimeConfig
+from src.release_workflow import ReleaseWorkflow, RuntimeConfig
 from src.tools.slack_tools import SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
@@ -140,7 +140,7 @@ class ManualReleaseFlowCrewRuntime(_KickoffCompatibleRuntime):
             next_state = WorkflowState(
                 active_release=ReleaseContext(
                     release_version=active.release_version,
-                    step=ReleaseStep.JIRA_RELEASE_CREATED,
+                    step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
                     slack_channel_id=active.slack_channel_id,
                     message_ts=dict(active.message_ts),
                     thread_ts=dict(active.thread_ts),
@@ -153,7 +153,7 @@ class ManualReleaseFlowCrewRuntime(_KickoffCompatibleRuntime):
                 checkpoints=list(state.checkpoints),
             )
             return CrewDecision(
-                next_step=ReleaseStep.JIRA_RELEASE_CREATED,
+                next_step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
                 next_state=next_state,
                 audit_reason="manual_release_confirmed",
                 tool_calls=[
@@ -167,12 +167,15 @@ class ManualReleaseFlowCrewRuntime(_KickoffCompatibleRuntime):
                         },
                     },
                     {
-                        "tool": "functions.slack_message",
-                        "reason": "send manual release instructions",
+                        "tool": "functions.slack_approve",
+                        "reason": "request meeting confirmation",
                         "args": {
                             "channel_id": event_channel,
-                            "text": MANUAL_RELEASE_MESSAGE,
-                            "thread_ts": event_message_ts,
+                            "text": (
+                                "Подтвердите, что встреча фиксации релиза 5.104.0 проведена "
+                                "и можно переходить к сбору readiness."
+                            ),
+                            "approve_label": "Митинг проведен",
                         },
                     },
                 ],
@@ -441,25 +444,24 @@ def test_runtime_executes_manual_release_confirmation_flow(tmp_path: Path, monke
     )
     second_state = workflow.tick()
 
-    assert len(approvals) == 1
+    assert len(approvals) == 2
     assert approvals[0][0] == "C0AGLKF6KHD"
     assert approvals[0][2] == "Релиз создан"
+    assert approvals[1][0] == "C0AGLKF6KHD"
+    assert approvals[1][2] == "Митинг проведен"
     assert first_state.active_release is not None
     assert first_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert first_state.active_release.message_ts["manual_release_confirmation"] == "1700000000.200000"
     assert first_state.completed_actions == {}
 
-    assert len(messages) == 1
-    assert messages[0][0] == "C0AGLKF6KHD"
-    assert messages[0][1] == MANUAL_RELEASE_MESSAGE
-    assert messages[0][2] == "1700000000.200000"
+    assert len(messages) == 0
     assert len(updates) == 1
     assert updates[0][0] == "C0AGLKF6KHD"
     assert updates[0][1] == "1700000000.200000"
     assert updates[0][2].endswith(":white_check_mark:")
     assert second_state.active_release is not None
-    assert second_state.active_release.step == ReleaseStep.JIRA_RELEASE_CREATED
-    assert second_state.active_release.message_ts["manual_release_instruction"] == "1700000000.300000"
+    assert second_state.active_release.step == ReleaseStep.WAIT_MEETING_CONFIRMATION
+    assert second_state.active_release.message_ts["meeting_confirmation"] == "1700000000.200000"
     assert second_state.completed_actions == {}
 
 
@@ -760,11 +762,11 @@ def test_non_user_transition_does_not_prune_completed_actions(tmp_path: Path) ->
             active = state.active_release
             assert active is not None
             return CrewDecision(
-                next_step=ReleaseStep.JIRA_RELEASE_CREATED,
+                next_step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
                 next_state=WorkflowState(
                     active_release=ReleaseContext(
                         release_version=active.release_version,
-                        step=ReleaseStep.JIRA_RELEASE_CREATED,
+                        step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
                         slack_channel_id=active.slack_channel_id,
                         message_ts=dict(active.message_ts),
                         thread_ts=dict(active.thread_ts),
@@ -807,7 +809,7 @@ def test_non_user_transition_does_not_prune_completed_actions(tmp_path: Path) ->
 
     state = workflow.tick()
 
-    assert state.step == ReleaseStep.JIRA_RELEASE_CREATED
+    assert state.step == ReleaseStep.WAIT_MEETING_CONFIRMATION
     assert "manual-release-instruction:5.104.0" in state.completed_actions
     assert "approval-confirmed-update:5.104.0:1772140000.123456" in state.completed_actions
     cleanup_checkpoints = [cp for cp in state.checkpoints if cp.get("tool") == "state_cleanup"]

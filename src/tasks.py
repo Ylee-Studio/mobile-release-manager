@@ -5,12 +5,34 @@ from crewai import Task
 
 from .runtime_contracts import AgentDecisionPayload
 
+_RELEASE_STEP_VALUES = (
+    "IDLE|WAIT_START_APPROVAL|"
+    "WAIT_MANUAL_RELEASE_CONFIRMATION|WAIT_MEETING_CONFIRMATION|"
+    "WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT"
+)
+_TOOL_NAMES = "slack_message, slack_approve, slack_update"
+_TOOL_EXAMPLES = (
+    "{tool:'slack_message',args:{channel_id:'C123',text:'ok',thread_ts:'177.1'}}; "
+    "{tool:'slack_approve',args:{channel_id:'C123',text:'approve?',approve_label:'Подтвердить'}}; "
+    "{tool:'slack_update',args:{channel_id:'C123',message_ts:'177.1',text:'done'}}."
+)
+_COMMON_SCHEMA_DEFS = (
+    f"Schema definitions:\n"
+    f"- ReleaseStep := {_RELEASE_STEP_VALUES}\n"
+    '- ToolCall := {"tool":"name","reason":"why","args":{...}}\n'
+)
+_COMMON_FORMAT_RULES = (
+    f"Use only canonical tool names: {_TOOL_NAMES} "
+    "(never use functions.* aliases). "
+    f"Tool args must match args_schema exactly. Valid examples: {_TOOL_EXAMPLES}"
+)
+
 
 def build_orchestrator_task(agent, slack_tools):
     """Return orchestrator task that controls workflow routing."""
     return Task(
         description=(
-            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason`, `memory_context` as inputs. "
+            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason` as inputs. "
             "Read workflow context, choose next release step, and decide whether "
             "Release Manager must be invoked for release-specific actions."
             "\n"
@@ -20,30 +42,30 @@ def build_orchestrator_task(agent, slack_tools):
             "config={config}\n"
             "now_iso={now_iso}\n"
             "trigger_reason={trigger_reason}\n"
-            "memory_context={memory_context}\n"
             "\n"
+            f"{_COMMON_SCHEMA_DEFS}"
             "Required output JSON schema:\n"
             "{\n"
-            '  "next_step": "IDLE|WAIT_START_APPROVAL|RELEASE_MANAGER_CREATED|'
-            'WAIT_MANUAL_RELEASE_CONFIRMATION|JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
-            'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
+            '  "next_step": "<ReleaseStep>",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
-            '  "tool_calls": [{"tool": "name", "reason": "why", "args": {...}}],\n'
+            '  "tool_calls": [<ToolCall>],\n'
             '  "audit_reason": "short explanation",\n'
             '  "invoke_release_manager": true|false\n'
             "}\n"
+            "Behavior requirements:\n"
+            "- Orchestrator is responsible for routing and state transitions.\n"
+            "- For release-manager phases (WAIT_MANUAL_RELEASE_CONFIRMATION, "
+            "WAIT_MEETING_CONFIRMATION, "
+            "WAIT_READINESS_CONFIRMATIONS, "
+            "READY_FOR_BRANCH_CUT), prefer delegating release-specific Slack side effects "
+            "to Release Manager to avoid duplicate actions.\n"
             "Set invoke_release_manager=true only when active release exists and "
             "release manager should continue execution. "
-            "If next_step is one of RELEASE_MANAGER_CREATED, WAIT_MANUAL_RELEASE_CONFIRMATION, "
-            "JIRA_RELEASE_CREATED, WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, "
+            "If next_step is one of WAIT_MANUAL_RELEASE_CONFIRMATION, "
+            "WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, "
             "or READY_FOR_BRANCH_CUT, set invoke_release_manager=true. "
             "Use `next_state` as the complete state snapshot for persistence. "
-            "Use only canonical tool names: slack_message, slack_approve, slack_update "
-            "(never use functions.* aliases). "
-            "Tool args must match args_schema exactly. Valid examples: "
-            "{tool:'slack_message',args:{channel_id:'C123',text:'ok',thread_ts:'177.1'}}; "
-            "{tool:'slack_approve',args:{channel_id:'C123',text:'approve?',approve_label:'Подтвердить'}}; "
-            "{tool:'slack_update',args:{channel_id:'C123',message_ts:'177.1',text:'done'}}."
+            f"{_COMMON_FORMAT_RULES}"
         ),
         expected_output=(
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager."
@@ -58,7 +80,7 @@ def build_release_manager_task(agent, slack_tools):
     """Return release-manager task that executes release side effects."""
     return Task(
         description=(
-            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason`, `memory_context` as inputs. "
+            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason` as inputs. "
             "Use active release context only, execute Slack side effects for "
             "that release, and return the updated workflow state."
             "\n"
@@ -68,16 +90,18 @@ def build_release_manager_task(agent, slack_tools):
             "config={config}\n"
             "now_iso={now_iso}\n"
             "trigger_reason={trigger_reason}\n"
-            "memory_context={memory_context}\n"
             "\n"
             "Behavior requirements:\n"
             "- Do NOT auto-create Jira releases.\n"
-            "- Move from RELEASE_MANAGER_CREATED to WAIT_MANUAL_RELEASE_CONFIRMATION and "
-            "request confirmation via slack_approve.\n"
+            "- Move from WAIT_START_APPROVAL directly to WAIT_MANUAL_RELEASE_CONFIRMATION and "
+            "request release creation confirmation via exactly one slack_approve tool call.\n"
+            "- For that transition, do not emit slack_message; the confirmation text in "
+            "slack_approve must include all required context.\n"
             "- After any approval_confirmed event, include slack_update for the trigger "
             "message so buttons disappear and text ends with :white_check_mark:.\n"
-            "- After manual confirmation event, move to JIRA_RELEASE_CREATED and include "
-            "a slack_message tool call to notify the channel.\n"
+            "- After manual release confirmation event, move directly to "
+            "WAIT_MEETING_CONFIRMATION and include exactly one slack_approve tool call "
+            "that asks to confirm the release-fixation meeting.\n"
             "- When transitioning to WAIT_READINESS_CONFIRMATIONS, include exactly one "
             "slack_message tool call with non-empty args.channel_id and args.text. "
             "args.text must include: "
@@ -90,19 +114,17 @@ def build_release_manager_task(agent, slack_tools):
             "- If next_step is WAIT_READINESS_CONFIRMATIONS and required readiness message "
             "is missing, keep current step unchanged and return audit_reason explaining why.\n"
             "\n"
+            f"{_COMMON_SCHEMA_DEFS}"
             "Required output JSON schema:\n"
             "{\n"
-            '  "next_step": "IDLE|WAIT_START_APPROVAL|RELEASE_MANAGER_CREATED|'
-            'WAIT_MANUAL_RELEASE_CONFIRMATION|JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
-            'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
+            '  "next_step": "<ReleaseStep>",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
-            '  "tool_calls": [{"tool": "name", "reason": "why", "args": {...}}],\n'
+            '  "tool_calls": [<ToolCall>],\n'
             '  "audit_reason": "short explanation"\n'
             "}\n"
             "Use `next_state` as the complete state snapshot for persistence. "
-            "Use only canonical tool names: slack_message, slack_approve, slack_update "
-            "(never use functions.* aliases). "
-            "Tool args must match args_schema exactly and include all required fields. "
+            f"{_COMMON_FORMAT_RULES} "
+            "Include all required tool fields. "
             "If no change is needed, return the same state with matching next_step."
         ),
         expected_output=(

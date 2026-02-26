@@ -5,6 +5,12 @@ from crewai import Agent
 
 from .policies import PolicyConfig
 
+_CANONICAL_TOOLS = "slack_message, slack_approve, slack_update"
+_TOOL_FORMAT_RULE = (
+    f"Use canonical tool names ({_CANONICAL_TOOLS}) without `functions.` prefix, "
+    "and ensure each tool call includes `args` matching args_schema."
+)
+
 
 def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
     """Create orchestrator agent responsible for release routing decisions."""
@@ -27,9 +33,13 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, audit_reason, and optional invoke_release_manager flag. "
-            "When you include tool_calls, always use canonical tool names "
-            "(`slack_message`, `slack_approve`, `slack_update`) without `functions.` prefix. "
-            "Each tool call must include `args` that fully match tool args_schema. "
+            "You are responsible for routing and state transitions, not release-manager side effects. "
+            f"{_TOOL_FORMAT_RULE} "
+            "If next_step is in release-manager phases "
+            "(WAIT_MANUAL_RELEASE_CONFIRMATION, WAIT_MEETING_CONFIRMATION, "
+            "WAIT_READINESS_CONFIRMATIONS, "
+            "READY_FOR_BRANCH_CUT), prefer keeping `tool_calls` empty and set "
+            "invoke_release_manager=true so release-specific side effects run in Release Manager. "
             "Set invoke_release_manager=true only when an active release exists and the "
             "release manager must process release-specific side effects. Keep state "
             "consistent with ReleaseStep enum and track incoming events using "
@@ -60,14 +70,16 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, and audit_reason. Use only the active release context and "
-            "use canonical tool names (`slack_message`, `slack_approve`, `slack_update`) "
-            "with `args` matching args_schema exactly. "
-            "incoming events. Use `slack_approve` to request manual release confirmation "
-            "before moving to JIRA_RELEASE_CREATED. For every approval_confirmed event, "
+            f"{_TOOL_FORMAT_RULE} "
+            "Analyze incoming events. Use exactly one `slack_approve` tool call to request "
+            "manual release confirmation when transitioning to "
+            "WAIT_MANUAL_RELEASE_CONFIRMATION, and do not emit `slack_message` for that "
+            "transition. After manual release confirmation, move directly to "
+            "WAIT_MEETING_CONFIRMATION and request meeting confirmation with exactly one "
+            "`slack_approve` tool call. For every approval_confirmed event, "
             "add a `slack_update` tool call that updates the original approval message, "
             "removes buttons, and appends :white_check_mark: to its text. Then use "
-            "`slack_message` to notify the channel about manual Jira release creation "
-            "and release-fixation meeting. "
+            "`slack_message` for readiness communication only after meeting confirmation. "
             "When moving to WAIT_READINESS_CONFIRMATIONS, always include exactly one "
             "`slack_message` tool call with non-empty `args.channel_id` and `args.text`. "
             "The readiness text must follow this format: "
@@ -80,6 +92,6 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
             "If you cannot produce that message, do not move to WAIT_READINESS_CONFIRMATIONS. "
             "When tools return message_ts, persist it into "
             "next_state.active_release.message_ts/thread_ts where applicable. "
-            "Do not skip valid tool calls based on previously completed actions."
+            "Emit tool calls only for the current transition and avoid repeating them when no new trigger event exists."
         ),
     )

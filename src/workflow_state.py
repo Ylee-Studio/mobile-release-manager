@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -14,9 +16,7 @@ def utc_now_iso() -> str:
 class ReleaseStep(str, Enum):
     IDLE = "IDLE"
     WAIT_START_APPROVAL = "WAIT_START_APPROVAL"
-    RELEASE_MANAGER_CREATED = "RELEASE_MANAGER_CREATED"
     WAIT_MANUAL_RELEASE_CONFIRMATION = "WAIT_MANUAL_RELEASE_CONFIRMATION"
-    JIRA_RELEASE_CREATED = "JIRA_RELEASE_CREATED"
     WAIT_MEETING_CONFIRMATION = "WAIT_MEETING_CONFIRMATION"
     WAIT_READINESS_CONFIRMATIONS = "WAIT_READINESS_CONFIRMATIONS"
     READY_FOR_BRANCH_CUT = "READY_FOR_BRANCH_CUT"
@@ -25,9 +25,11 @@ class ReleaseStep(str, Enum):
 _STATUS_TO_STEP: dict[str, ReleaseStep] = {
     "AWAITING_START_APPROVAL": ReleaseStep.WAIT_START_APPROVAL,
     "WAITING_START_APPROVAL": ReleaseStep.WAIT_START_APPROVAL,
-    "RELEASE_MANAGER_ACTIVE": ReleaseStep.RELEASE_MANAGER_CREATED,
+    "RELEASE_MANAGER_ACTIVE": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+    "RELEASE_MANAGER_CREATED": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
     "AWAITING_MANUAL_RELEASE_CONFIRMATION": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
-    "JIRA_RELEASE_READY": ReleaseStep.JIRA_RELEASE_CREATED,
+    "JIRA_RELEASE_READY": ReleaseStep.WAIT_MEETING_CONFIRMATION,
+    "JIRA_RELEASE_CREATED": ReleaseStep.WAIT_MEETING_CONFIRMATION,
     "AWAITING_MEETING_CONFIRMATION": ReleaseStep.WAIT_MEETING_CONFIRMATION,
     "AWAITING_READINESS_CONFIRMATIONS": ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
 }
@@ -142,3 +144,13 @@ class WorkflowState:
             completed_actions=dict(raw.get("completed_actions", {})),
             checkpoints=list(raw.get("checkpoints", [])),
         )
+
+
+class ReleaseFlowState(BaseModel):
+    """CrewAI Flow state wrapper for release workflow execution."""
+
+    state: dict[str, Any] = Field(default_factory=dict)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+    trigger_reason: str = "heartbeat_timer"
+    now_iso: str = ""

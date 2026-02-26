@@ -5,9 +5,15 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from crewai import Crew, Process
+try:  # pragma: no cover - Memory may differ by crewai version
+    from crewai import Crew, Memory, Process
+except Exception:  # pragma: no cover - fallback for older crewai
+    from crewai import Crew, Process
+
+    Memory = None  # type: ignore[assignment]
 
 from .agents import build_orchestrator_agent, build_release_manager_agent
 from .observability import CrewRuntimeCallbacks
@@ -16,9 +22,9 @@ from .runtime_contracts import AgentDecisionPayload
 from .tasks import build_orchestrator_task, build_release_manager_task
 from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
 from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, SlackMessageTool, SlackUpdateTool
-from .workflow_state import ReleaseStep, WorkflowState
+from .workflow_state import ReleaseFlowState, ReleaseStep, WorkflowState
 
-from crewai.flow.flow import Flow, listen, start
+from crewai.flow.flow import Flow, listen, router, start
 
 try:  # pragma: no cover - optional decorator path varies by crewai version
     from crewai.flow.flow import persist
@@ -92,24 +98,75 @@ class FlowTurnContext:
 
 
 @persist()
-class ReleaseDecisionFlow(Flow):
-    """CrewAI Flow wrapper for orchestrator/release-manager turn."""
+class ReleaseFlow(Flow[ReleaseFlowState]):
+    """Release workflow as explicit step-routed CrewAI Flow."""
 
     def __init__(self, *, coordinator: "CrewRuntimeCoordinator") -> None:
         super().__init__()
         self.coordinator = coordinator
+        self._current_context: FlowTurnContext | None = None
 
     @start()
-    def orchestrator_turn(self, inputs: dict[str, Any]) -> FlowTurnContext:
-        return self.coordinator._run_flow_orchestrator_turn(inputs=inputs)
+    def orchestrator_turn(self) -> FlowTurnContext:
+        if not self.state.now_iso:
+            self.state.now_iso = datetime.now(timezone.utc).isoformat()
+        return self.coordinator._run_flow_orchestrator_turn(
+            inputs={
+                "state": self.state.state,
+                "events": self.state.events,
+                "config": self.state.config,
+                "now_iso": self.state.now_iso,
+                "trigger_reason": self.state.trigger_reason,
+            }
+        )
 
-    @listen(orchestrator_turn)
-    def release_manager_turn(self, context: FlowTurnContext) -> CrewDecision:
-        return self.coordinator._run_flow_release_manager_turn(context=context)
+    @router(orchestrator_turn)
+    def route_release_step(self, context: FlowTurnContext) -> str:
+        self._current_context = context
+        step = context.orchestrator_decision.next_step
+        if step in {
+            ReleaseStep.IDLE,
+            ReleaseStep.WAIT_START_APPROVAL,
+            ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+            ReleaseStep.WAIT_MEETING_CONFIRMATION,
+            ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+            ReleaseStep.READY_FOR_BRANCH_CUT,
+        }:
+            return step.value
+        return "UNKNOWN_STEP"
 
-    def kickoff(self, *, inputs: dict[str, Any]) -> CrewDecision:
-        context = self.orchestrator_turn(inputs)
-        return self.release_manager_turn(context)
+    @listen(ReleaseStep.IDLE.value)
+    def on_idle(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_idle(context=self._context())
+
+    @listen(ReleaseStep.WAIT_START_APPROVAL.value)
+    def on_wait_start_approval(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_wait_start_approval(context=self._context())
+
+    @listen(ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value)
+    def on_wait_manual_release_confirmation(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_wait_manual_release_confirmation(context=self._context())
+
+    @listen(ReleaseStep.WAIT_MEETING_CONFIRMATION.value)
+    def on_wait_meeting_confirmation(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_wait_meeting_confirmation(context=self._context())
+
+    @listen(ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value)
+    def on_wait_readiness_confirmations(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_wait_readiness_confirmations(context=self._context())
+
+    @listen(ReleaseStep.READY_FOR_BRANCH_CUT.value)
+    def on_ready_for_branch_cut(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_ready_for_branch_cut(context=self._context())
+
+    @listen("UNKNOWN_STEP")
+    def on_unknown_step(self, _label: str) -> CrewDecision:
+        return self.coordinator.handle_step_unknown(context=self._context())
+
+    def _context(self) -> FlowTurnContext:
+        if self._current_context is None:
+            raise RuntimeError("release flow context is unavailable")
+        return self._current_context
 
 
 class CrewRuntimeCoordinator:
@@ -136,7 +193,9 @@ class CrewRuntimeCoordinator:
         self._release_manager_agents: dict[str, Any] = {}
         self._orchestrator_crew: Any | None = None
         self._release_manager_crews: dict[str, Any] = {}
-        self.flow = ReleaseDecisionFlow(coordinator=self)
+        self._orchestrator_memory = self._build_crewai_memory_scope(scope_name="orchestrator")
+        self._release_manager_memories: dict[str, Any] = {}
+        self.flow = ReleaseFlow(coordinator=self)
 
     def kickoff(
         self,
@@ -148,10 +207,15 @@ class CrewRuntimeCoordinator:
         trigger_reason: str = "heartbeat_timer",
     ) -> CrewDecision:
         inputs = {
-            "state": state,
-            "events": events,
-            "config": config,
-            "now": now,
+            "state": state.to_dict(),
+            "events": [self._event_to_dict(event) for event in events],
+            "config": {
+                "slack_channel_id": config.slack_channel_id,
+                "timezone": config.timezone,
+                "jira_project_keys": config.jira_project_keys,
+                "readiness_owners": config.readiness_owners,
+            },
+            "now_iso": (now or datetime.now(timezone.utc)).isoformat(),
             "trigger_reason": trigger_reason,
         }
         try:
@@ -166,28 +230,16 @@ class CrewRuntimeCoordinator:
             )
 
     def _run_flow_orchestrator_turn(self, *, inputs: dict[str, Any]) -> FlowTurnContext:
-        state = inputs["state"]
-        events = inputs["events"]
-        config = inputs["config"]
-        now = inputs.get("now")
+        state = WorkflowState.from_dict(inputs.get("state", {}))
+        events = list(inputs.get("events", []))
+        config = inputs.get("config", {})
         trigger_reason = str(inputs.get("trigger_reason", "heartbeat_timer"))
         payload = {
             "state": state.to_dict(),
-            "events": [self._event_to_dict(event) for event in events],
-            "config": {
-                "slack_channel_id": config.slack_channel_id,
-                "timezone": config.timezone,
-                "jira_project_keys": config.jira_project_keys,
-                "readiness_owners": config.readiness_owners,
-            },
-            "now_iso": (now or datetime.now(timezone.utc)).isoformat(),
+            "events": events,
+            "config": config if isinstance(config, dict) else {},
+            "now_iso": str(inputs.get("now_iso") or datetime.now(timezone.utc).isoformat()),
             "trigger_reason": trigger_reason,
-            "memory_context": {
-                "active_step": state.step.value,
-                "processed_event_ids": list(state.processed_event_ids),
-                "completed_actions_count": len(state.completed_actions),
-                "snapshot_backend": "crewai_memory",
-            },
         }
         orchestrator_payload, orchestrator_native_calls = self._run_orchestrator(payload=payload)
         orchestrator_decision = CrewDecision.from_payload(
@@ -259,6 +311,28 @@ class CrewRuntimeCoordinator:
                 audit_reason=f"crew_runtime_error:{exc.__class__.__name__}",
             )
 
+    # Step-specific flow handlers keep ReleaseFlow aligned with explicit ReleaseStep routing.
+    def handle_step_idle(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
+    def handle_step_wait_start_approval(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
+    def handle_step_wait_manual_release_confirmation(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
+    def handle_step_wait_meeting_confirmation(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
+    def handle_step_wait_readiness_confirmations(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
+    def handle_step_ready_for_branch_cut(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
+    def handle_step_unknown(self, *, context: FlowTurnContext) -> CrewDecision:
+        return self._run_flow_release_manager_turn(context=context)
+
     @staticmethod
     def _event_to_dict(event: SlackEvent) -> dict[str, Any]:
         return {
@@ -302,10 +376,15 @@ class CrewRuntimeCoordinator:
             tracing=False,
             step_callback=self.callbacks.on_step,
             task_callback=self.callbacks.on_task,
+            **self._crew_memory_kwargs(memory_obj=self._orchestrator_memory),
         )
 
     def _build_release_manager_crew(self, *, release_version: str, agent: Any) -> Any:
-        _ = release_version
+        key = release_version.strip() or "unknown-release"
+        memory_obj = self._release_manager_memories.get(key)
+        if memory_obj is None:
+            memory_obj = self._build_crewai_memory_scope(scope_name=f"release_manager_{key}")
+            self._release_manager_memories[key] = memory_obj
         task = build_release_manager_task(agent=agent, slack_tools=self.slack_tools)
         return Crew(
             agents=[agent],
@@ -315,6 +394,7 @@ class CrewRuntimeCoordinator:
             tracing=False,
             step_callback=self.callbacks.on_step,
             task_callback=self.callbacks.on_task,
+            **self._crew_memory_kwargs(memory_obj=memory_obj),
         )
 
     def _cleanup_release_manager_agents(self, *, next_state: WorkflowState) -> None:
@@ -322,18 +402,21 @@ class CrewRuntimeCoordinator:
         if active_release is None:
             self._release_manager_agents.clear()
             self._release_manager_crews.clear()
+            self._release_manager_memories.clear()
             return
 
         active_version = active_release.release_version.strip()
         if not active_version:
             self._release_manager_agents.clear()
             self._release_manager_crews.clear()
+            self._release_manager_memories.clear()
             return
 
         stale_versions = [version for version in self._release_manager_agents.keys() if version != active_version]
         for version in stale_versions:
             self._release_manager_agents.pop(version, None)
             self._release_manager_crews.pop(version, None)
+            self._release_manager_memories.pop(version, None)
 
     def _run_release_manager(
         self,
@@ -373,6 +456,31 @@ class CrewRuntimeCoordinator:
     ) -> list[dict[str, Any]]:
         source = native_tool_calls if native_tool_calls else payload.get("tool_calls", [])
         return validate_and_normalize_tool_calls(source, schema_by_tool=self.tool_args_schema)
+
+    def _build_crewai_memory_scope(self, *, scope_name: str) -> Any | None:
+        if Memory is None:
+            return None
+        storage_root = self._memory_storage_root()
+        storage_path = storage_root / scope_name
+        storage_path.mkdir(parents=True, exist_ok=True)
+        try:
+            return Memory(storage=str(storage_path))
+        except TypeError:
+            return Memory()
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self.logger.warning("failed to init CrewAI memory for scope=%s: %s", scope_name, exc)
+            return None
+
+    def _memory_storage_root(self) -> Path:
+        base = Path(self.memory_db_path)
+        normalized = base.with_suffix("") if base.suffix else base
+        return normalized.parent / f"{normalized.name}_crew_memory"
+
+    @staticmethod
+    def _crew_memory_kwargs(*, memory_obj: Any | None) -> dict[str, Any]:
+        if memory_obj is None:
+            return {}
+        return {"memory": memory_obj}
 
 
 def _extract_structured_payload(result: Any) -> dict[str, Any]:
@@ -449,9 +557,7 @@ def _as_bool(value: Any) -> bool:
 
 def _step_requires_release_manager(step: ReleaseStep) -> bool:
     return step in {
-        ReleaseStep.RELEASE_MANAGER_CREATED,
         ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
-        ReleaseStep.JIRA_RELEASE_CREATED,
         ReleaseStep.WAIT_MEETING_CONFIRMATION,
         ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
         ReleaseStep.READY_FOR_BRANCH_CUT,

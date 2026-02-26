@@ -24,6 +24,7 @@ MANUAL_RELEASE_MESSAGE = (
     "Создайте релиз в https://instories.atlassian.net/jira/plans/1/scenarios/1/releases "
     "и проведите встречу фиксации релиза"
 )
+
 @dataclass
 class RuntimeConfig:
     slack_channel_id: str
@@ -258,6 +259,13 @@ class ReleaseWorkflow:
                 "и можно переходить к следующему шагу."
             )
             default_approve_label = "Релиз создан"
+        elif decision.next_step == ReleaseStep.WAIT_MEETING_CONFIRMATION:
+            message_key = "meeting_confirmation"
+            default_text = (
+                f"Подтвердите, что встреча фиксации релиза {release.release_version} проведена "
+                "и можно переходить к сбору readiness."
+            )
+            default_approve_label = "Митинг проведен"
         else:
             message_key = "start_approval"
             default_text = (
@@ -323,21 +331,14 @@ class ReleaseWorkflow:
         release = decision.next_state.active_release
         args_raw = call.get("args", {})
         args = args_raw if isinstance(args_raw, dict) else {}
-        if decision.next_step == ReleaseStep.JIRA_RELEASE_CREATED:
-            if release is None:
-                return
-            action_key = f"manual-release-instruction:{release.release_version}"
-            message_key = "manual_release_instruction"
-            text = MANUAL_RELEASE_MESSAGE
+        if release is not None:
+            message_key = "generic_message"
         else:
-            if release is not None:
-                message_key = "generic_message"
-            else:
-                message_key = ""
-            text = str(args.get("text") or "").strip()
-            if not text:
-                self.logger.warning("skip slack_message: empty text after validation")
-                return
+            message_key = ""
+        text = str(args.get("text") or "").strip()
+        if not text:
+            self.logger.warning("skip slack_message: empty text after validation")
+            return
 
         channel_id = (
             str(args.get("channel_id") or "").strip()
@@ -526,9 +527,7 @@ def _extract_latest_message_thread_ts(events: list[Any]) -> str:
 _STEP_SEQUENCE: tuple[ReleaseStep, ...] = (
     ReleaseStep.IDLE,
     ReleaseStep.WAIT_START_APPROVAL,
-    ReleaseStep.RELEASE_MANAGER_CREATED,
     ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
-    ReleaseStep.JIRA_RELEASE_CREATED,
     ReleaseStep.WAIT_MEETING_CONFIRMATION,
     ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
     ReleaseStep.READY_FOR_BRANCH_CUT,
@@ -539,13 +538,14 @@ _USER_EVENT_SOURCES: set[str] = {"slash_command", "events_api", "interactivity"}
 _ACTION_PREFIX_TO_STEP: tuple[tuple[str, ReleaseStep], ...] = (
     ("start-approval:", ReleaseStep.WAIT_START_APPROVAL),
     ("start_approval_request", ReleaseStep.WAIT_START_APPROVAL),
-    ("start_approval_confirmation", ReleaseStep.RELEASE_MANAGER_CREATED),
-    ("release_manager_created", ReleaseStep.RELEASE_MANAGER_CREATED),
-    ("create_crossspace_release", ReleaseStep.RELEASE_MANAGER_CREATED),
+    ("start_approval_confirmation", ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION),
+    ("release_manager_created", ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION),
+    ("create_crossspace_release", ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION),
     ("manual-release-confirmation-request:", ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION),
-    ("manual_release_confirmation", ReleaseStep.JIRA_RELEASE_CREATED),
-    ("manual-release-instruction:", ReleaseStep.JIRA_RELEASE_CREATED),
-    ("approval-confirmed-update:", ReleaseStep.JIRA_RELEASE_CREATED),
+    ("meeting-confirmation-request:", ReleaseStep.WAIT_MEETING_CONFIRMATION),
+    ("manual_release_confirmation", ReleaseStep.WAIT_MEETING_CONFIRMATION),
+    ("manual-release-instruction:", ReleaseStep.WAIT_MEETING_CONFIRMATION),
+    ("approval-confirmed-update:", ReleaseStep.WAIT_MEETING_CONFIRMATION),
     ("manual_set_idle", ReleaseStep.IDLE),
     ("ack_manual_set_idle_message", ReleaseStep.IDLE),
 )

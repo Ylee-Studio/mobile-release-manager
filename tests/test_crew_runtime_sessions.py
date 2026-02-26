@@ -23,7 +23,7 @@ def _config() -> SimpleNamespace:
 
 def _orchestrator_payload(*, release_version: str | None, invoke_release_manager: bool) -> dict:
     if release_version:
-        next_step = ReleaseStep.RELEASE_MANAGER_CREATED.value
+        next_step = ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION.value
         active_release = {
             "release_version": release_version,
             "step": next_step,
