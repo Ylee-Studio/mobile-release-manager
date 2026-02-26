@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.crew_memory import CrewAIMemory
 from src.crew_runtime import CrewDecision
 from src.release_workflow import ReleaseWorkflow, RuntimeConfig
 from src.tools.slack_tools import SlackGateway
@@ -88,9 +88,21 @@ class _PauseResumeRuntime:
         )
 
 
+@dataclass
+class _InMemoryWorkflowMemory:
+    state: WorkflowState = field(default_factory=WorkflowState)
+
+    def load_state(self) -> WorkflowState:
+        return WorkflowState.from_dict(self.state.to_dict())
+
+    def save_state(self, state: WorkflowState, *, reason: str) -> None:
+        _ = reason
+        self.state = WorkflowState.from_dict(state.to_dict())
+
+
 def _build_workflow(tmp_path: Path) -> ReleaseWorkflow:
     cfg = _runtime_config(tmp_path)
-    memory = CrewAIMemory(db_path=cfg.memory_db_path)
+    memory = _InMemoryWorkflowMemory()
     gateway = SlackGateway(bot_token=cfg.slack_bot_token, events_path=Path(cfg.slack_events_path))
     runtime = _PauseResumeRuntime()
     return ReleaseWorkflow(

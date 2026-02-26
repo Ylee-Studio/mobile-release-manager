@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
 
-from .crew_memory import CrewAIMemory
 from .crew_runtime import CrewDecision, CrewRuntimeCoordinator
 from .flow_pending_store import FlowPendingStore
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
@@ -21,10 +22,7 @@ from .tools.slack_tools import (
 )
 from .workflow_state import ReleaseStep, WorkflowState
 
-MANUAL_RELEASE_MESSAGE = (
-    "Создайте релиз в https://instories.atlassian.net/jira/plans/1/scenarios/1/releases "
-    "и проведите встречу фиксации релиза"
-)
+MANUAL_RELEASE_MESSAGE = "Подтвердите создание релиза {release_version} в JIRA."
 
 @dataclass
 class RuntimeConfig:
@@ -53,7 +51,7 @@ class ReleaseWorkflow:
         self,
         *,
         config: RuntimeConfig,
-        memory: WorkflowMemory | CrewAIMemory,
+        memory: WorkflowMemory,
         slack_gateway: SlackGateway,
         crew_runtime: CrewRuntimeCoordinator | Any,
     ):
@@ -363,10 +361,7 @@ class ReleaseWorkflow:
             return
         if decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION:
             message_key = "manual_release_confirmation"
-            default_text = (
-                f"Подтвердите, что релиз {release.release_version} создан вручную в Jira plan, "
-                "и можно переходить к следующему шагу."
-            )
+            default_text = MANUAL_RELEASE_MESSAGE.format(release_version=release.release_version)
             default_approve_label = "Релиз создан"
         elif decision.next_step == ReleaseStep.WAIT_MEETING_CONFIRMATION:
             message_key = "meeting_confirmation"
@@ -458,6 +453,13 @@ class ReleaseWorkflow:
             self.logger.warning("skip slack_message: empty text after validation")
             return
 
+        if release is not None and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
+            text = _normalize_readiness_message_text(
+                text=text,
+                release_version=release.release_version,
+                readiness_owners=self.config.readiness_owners,
+            )
+
         channel_id = (
             str(args.get("channel_id") or "").strip()
             or (release.slack_channel_id if release else "")
@@ -469,14 +471,18 @@ class ReleaseWorkflow:
             self.logger.warning("skip slack_message: empty channel_id for release=%s", release_version)
             return
 
-        thread_ts = str(args.get("thread_ts") or "").strip()
-        if not thread_ts and release is not None:
-            thread_ts = release.thread_ts.get("manual_release_confirmation")
-        if not thread_ts and release is not None:
-            thread_ts = release.thread_ts.get("start_approval")
-        if not thread_ts:
-            thread_ts = _extract_latest_message_thread_ts(events)
-        thread_ts_value = thread_ts or None
+        if release is not None and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
+            # Readiness announcement must be a top-level channel message.
+            thread_ts_value = None
+        else:
+            thread_ts = str(args.get("thread_ts") or "").strip()
+            if not thread_ts and release is not None:
+                thread_ts = release.thread_ts.get("manual_release_confirmation")
+            if not thread_ts and release is not None:
+                thread_ts = release.thread_ts.get("start_approval")
+            if not thread_ts:
+                thread_ts = _extract_latest_message_thread_ts(events)
+            thread_ts_value = thread_ts or None
 
         decision.next_state.checkpoints.append(
             {
@@ -653,6 +659,77 @@ def _extract_latest_message_thread_ts(events: list[Any]) -> str:
         if message_ts:
             return message_ts
     return ""
+
+
+def _readiness_jql_query(release_version: str) -> str:
+    return f"fixVersion = {release_version} ORDER BY project ASC, type DESC, key ASC"
+
+
+def _readiness_issues_url(release_version: str) -> str:
+    encoded = quote(_readiness_jql_query(release_version), safe="")
+    return f"https://instories.atlassian.net/issues/?jql={encoded}"
+
+
+def _format_slack_owner_mention(owner: str) -> str:
+    normalized = str(owner or "").strip()
+    if not normalized:
+        return normalized
+    if normalized.startswith("<@") and normalized.endswith(">"):
+        return normalized
+    if normalized.startswith("@"):
+        return normalized
+    return f"@{normalized}"
+
+
+def _normalize_readiness_message_text(
+    *,
+    text: str,
+    release_version: str,
+    readiness_owners: dict[str, str],
+) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return f"Релиз <{_readiness_issues_url(release_version)}|{release_version}>"
+
+    lines = normalized.splitlines()
+    for idx, line in enumerate(lines):
+        if not line.strip():
+            continue
+        lines[idx] = f"Релиз <{_readiness_issues_url(release_version)}|{release_version}>"
+        break
+
+    status_idx = next(
+        (idx for idx, line in enumerate(lines) if line.strip() == "Статус готовности к срезу:"),
+        None,
+    )
+    prompt_idx = next(
+        (
+            idx
+            for idx, line in enumerate(lines)
+            if line.strip().startswith("Напишите в треде по готовности своей части.")
+        ),
+        None,
+    )
+    if status_idx is not None and prompt_idx is not None and prompt_idx > status_idx:
+        readiness_lines = [
+            f":hourglass_flowing_sand: {team} {_format_slack_owner_mention(owner)}"
+            for team, owner in readiness_owners.items()
+        ]
+        lines = [
+            *lines[: status_idx + 1],
+            *readiness_lines,
+            "",
+            *lines[prompt_idx:],
+        ]
+
+    normalized_message = "\n".join(lines)
+    normalized_message = re.sub(
+        r"\*{0,2}\s*Важное напоминание\s*\*{0,2}",
+        "**Важное напоминание**",
+        normalized_message,
+        count=1,
+    )
+    return normalized_message
 
 
 _STEP_SEQUENCE: tuple[ReleaseStep, ...] = (

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.crew_memory import CrewAIMemory
 from src.crew_runtime import CrewDecision, CrewRuntimeCoordinator
 from src.policies import PolicyConfig
-from src.release_workflow import ReleaseWorkflow, RuntimeConfig
+from src.release_workflow import (
+    ReleaseWorkflow,
+    RuntimeConfig,
+    _normalize_readiness_message_text,
+)
 from src.tools.slack_tools import SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
@@ -56,9 +59,21 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfig:
     )
 
 
+@dataclass
+class _InMemoryWorkflowMemory:
+    state: WorkflowState = field(default_factory=WorkflowState)
+
+    def load_state(self) -> WorkflowState:
+        return WorkflowState.from_dict(self.state.to_dict())
+
+    def save_state(self, state: WorkflowState, *, reason: str) -> None:
+        _ = reason
+        self.state = WorkflowState.from_dict(state.to_dict())
+
+
 def test_release_workflow_propagates_trigger_reason_to_runtime(tmp_path: Path) -> None:
     config = _runtime_config(tmp_path)
-    memory = CrewAIMemory(db_path=config.memory_db_path)
+    memory = _InMemoryWorkflowMemory()
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=Path(config.slack_events_path))
     runtime = _KickoffProbeRuntime()
     workflow = ReleaseWorkflow(
@@ -87,7 +102,7 @@ def test_release_workflow_keeps_paused_state_without_approval_event(tmp_path: Pa
             )
 
     config = _runtime_config(tmp_path)
-    memory = CrewAIMemory(db_path=config.memory_db_path)
+    memory = _InMemoryWorkflowMemory()
     paused_state = WorkflowState(
         active_release=ReleaseContext(
             release_version="5.104.0",
@@ -141,3 +156,45 @@ def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch,
     assert decision.next_step == initial_state.step
     assert decision.next_state == initial_state
     assert decision.audit_reason.startswith("crew_runtime_error:")
+
+
+def test_normalize_readiness_message_adds_mentions_and_keeps_reminder_bold() -> None:
+    source = (
+        "Релиз 5.104.0\n\n"
+        "Статус готовности к срезу:\n"
+        ":hourglass_flowing_sand: Growth Мурат Камалов\n"
+        ":hourglass_flowing_sand: Core Антон Давыдов\n\n"
+        "Напишите в треде по готовности своей части.\n"
+        "Важное напоминание – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "едут в релиз только после одобрения QA"
+    )
+    normalized = _normalize_readiness_message_text(
+        text=source,
+        release_version="5.104.0",
+        readiness_owners={
+            "Growth": "Мурат Камалов",
+            "Core": "Антон Давыдов",
+        },
+    )
+
+    assert ":hourglass_flowing_sand: Growth @Мурат Камалов" in normalized
+    assert ":hourglass_flowing_sand: Core @Антон Давыдов" in normalized
+    assert "**Важное напоминание** – все задачи" in normalized
+
+
+def test_normalize_readiness_message_preserves_existing_slack_id_mentions() -> None:
+    source = (
+        "Релиз 5.104.0\n\n"
+        "Статус готовности к срезу:\n"
+        ":hourglass_flowing_sand: Growth Someone\n\n"
+        "Напишите в треде по готовности своей части.\n"
+        "**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "едут в релиз только после одобрения QA"
+    )
+    normalized = _normalize_readiness_message_text(
+        text=source,
+        release_version="5.104.0",
+        readiness_owners={"Growth": "<@U12345>"},
+    )
+
+    assert ":hourglass_flowing_sand: Growth <@U12345>" in normalized
