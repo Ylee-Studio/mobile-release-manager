@@ -1,4 +1,6 @@
 from src.crew_runtime import CrewDecision
+from src.tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
+from src.tools.slack_tools import SlackApproveInput
 from src.workflow_state import ReleaseStep, WorkflowState
 
 
@@ -120,3 +122,61 @@ def test_decision_accepts_manual_release_confirmation_alias_from_agent() -> None
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "5.104.0"
     assert decision.next_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+
+
+def test_native_tool_call_extraction_from_function_payload() -> None:
+    result = {
+        "tasks_output": [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "slack_approve",
+                            "arguments": '{"channel_id":"C0AGLKF6KHD","text":"start","approve_label":"Ok"}',
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    extracted = extract_native_tool_calls(result)
+
+    assert extracted == [
+        {
+            "tool": "slack_approve",
+            "reason": "",
+            "args": {"channel_id": "C0AGLKF6KHD", "text": "start", "approve_label": "Ok"},
+        }
+    ]
+
+
+def test_validation_normalizes_functions_alias_and_validates_args_schema() -> None:
+    tool_calls = [
+        {
+            "tool": "functions.slack_approve",
+            "reason": "request approval",
+            "args": {
+                "channel_id": " C0AGLKF6KHD ",
+                "text": " Подтвердите старт ",
+                "approve_label": " Подтвердить ",
+            },
+        }
+    ]
+
+    validated = validate_and_normalize_tool_calls(
+        tool_calls,
+        schema_by_tool={"slack_approve": SlackApproveInput},
+    )
+
+    assert validated == [
+        {
+            "tool": "slack_approve",
+            "reason": "request approval",
+            "args": {
+                "channel_id": "C0AGLKF6KHD",
+                "text": "Подтвердите старт",
+                "approve_label": "Подтвердить",
+            },
+        }
+    ]

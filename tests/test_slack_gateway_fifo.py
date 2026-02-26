@@ -80,3 +80,17 @@ def test_poll_events_drops_malformed_head(tmp_path: Path) -> None:
 
     assert first == []
     assert [event.event_id for event in second] == ["ev-2"]
+
+
+def test_pending_events_count_ignores_empty_lines(tmp_path: Path) -> None:
+    events_path = tmp_path / "slack_events.jsonl"
+    _append_raw(events_path, "")
+    _append_event(events_path, "ev-1")
+    _append_raw(events_path, "   ")
+    _append_event(events_path, "ev-2")
+    gateway = SlackGateway(
+        bot_token="xoxb-test-token",
+        events_path=events_path,
+    )
+
+    assert gateway.pending_events_count() == 2

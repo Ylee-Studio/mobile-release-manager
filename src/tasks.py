@@ -24,13 +24,19 @@ def build_orchestrator_task(agent, slack_tools):
             'WAIT_MANUAL_RELEASE_CONFIRMATION|JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
             'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
-            '  "tool_calls": [{"tool": "name", "reason": "why"}],\n'
+            '  "tool_calls": [{"tool": "name", "reason": "why", "args": {...}}],\n'
             '  "audit_reason": "short explanation",\n'
             '  "invoke_release_manager": true|false\n'
             "}\n"
             "Set invoke_release_manager=true only when active release exists and "
             "release manager should continue execution. "
-            "Use `next_state` as the complete state snapshot for persistence."
+            "Use `next_state` as the complete state snapshot for persistence. "
+            "Use only canonical tool names: slack_message, slack_approve, slack_update "
+            "(never use functions.* aliases). "
+            "Tool args must match args_schema exactly. Valid examples: "
+            "{tool:'slack_message',args:{channel_id:'C123',text:'ok',thread_ts:'177.1'}}; "
+            "{tool:'slack_approve',args:{channel_id:'C123',text:'approve?',approve_label:'Подтвердить'}}; "
+            "{tool:'slack_update',args:{channel_id:'C123',message_ts:'177.1',text:'done'}}."
         ),
         expected_output=(
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager."
@@ -76,10 +82,13 @@ def build_release_manager_task(agent, slack_tools):
             'WAIT_MANUAL_RELEASE_CONFIRMATION|JIRA_RELEASE_CREATED|WAIT_MEETING_CONFIRMATION|'
             'WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT",\n'
             '  "next_state": { ... WorkflowState dict ... },\n'
-            '  "tool_calls": [{"tool": "name", "reason": "why"}],\n'
+            '  "tool_calls": [{"tool": "name", "reason": "why", "args": {...}}],\n'
             '  "audit_reason": "short explanation"\n'
             "}\n"
             "Use `next_state` as the complete state snapshot for persistence. "
+            "Use only canonical tool names: slack_message, slack_approve, slack_update "
+            "(never use functions.* aliases). "
+            "Tool args must match args_schema exactly and include all required fields. "
             "If no change is needed, return the same state with matching next_step."
         ),
         expected_output=(

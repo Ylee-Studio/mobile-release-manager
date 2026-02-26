@@ -33,7 +33,17 @@ class FakeCrewRuntime:
                 next_step=ReleaseStep.WAIT_START_APPROVAL,
                 next_state=next_state,
                 audit_reason="manual_start_processed",
-                tool_calls=[{"tool": "slack_approve", "reason": "start confirmation"}],
+                tool_calls=[
+                    {
+                        "tool": "slack_approve",
+                        "reason": "start confirmation",
+                        "args": {
+                            "channel_id": config.slack_channel_id,
+                            "text": "Подтвердите старт релиза 1.0.0.",
+                            "approve_label": "Подтвердить",
+                        },
+                    }
+                ],
             )
 
         return CrewDecision(
@@ -74,7 +84,17 @@ class StartApprovalCrewRuntime:
                     checkpoints=[],
                 ),
                 audit_reason="manual_start_processed",
-                tool_calls=[{"tool": "functions.slack_approve", "reason": "request start approval"}],
+                tool_calls=[
+                    {
+                        "tool": "functions.slack_approve",
+                        "reason": "request start approval",
+                        "args": {
+                            "channel_id": config.slack_channel_id,
+                            "text": "Подтвердите старт релизного трейна 5.104.0.",
+                            "approve_label": "Подтвердить",
+                        },
+                    }
+                ],
             )
         return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
 
@@ -97,11 +117,23 @@ class ManualReleaseFlowCrewRuntime:
                     checkpoints=[],
                 ),
                 audit_reason="waiting_manual_release_confirmation",
-                tool_calls=[{"tool": "functions.slack_approve", "reason": "manual Jira release confirmation"}],
+                tool_calls=[
+                    {
+                        "tool": "functions.slack_approve",
+                        "reason": "manual Jira release confirmation",
+                        "args": {
+                            "channel_id": config.slack_channel_id,
+                            "text": "Подтвердите, что релиз 5.104.0 создан вручную в Jira plan.",
+                            "approve_label": "Релиз создан",
+                        },
+                    }
+                ],
             )
         if state.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION and any(
             e.event_type == "approval_confirmed" for e in events
         ):
+            event_channel = events[0].channel_id if events else config.slack_channel_id
+            event_message_ts = events[0].message_ts if events else ""
             active = state.active_release
             assert active is not None
             next_state = WorkflowState(
@@ -124,8 +156,49 @@ class ManualReleaseFlowCrewRuntime:
                 next_state=next_state,
                 audit_reason="manual_release_confirmed",
                 tool_calls=[
-                    {"tool": "functions.slack_update", "reason": "acknowledge confirmation"},
-                    {"tool": "functions.slack_message", "reason": "send manual release instructions"},
+                    {
+                        "tool": "functions.slack_update",
+                        "reason": "acknowledge confirmation",
+                        "args": {
+                            "channel_id": event_channel,
+                            "message_ts": event_message_ts,
+                            "text": "Подтверждение получено :white_check_mark:",
+                        },
+                    },
+                    {
+                        "tool": "functions.slack_message",
+                        "reason": "send manual release instructions",
+                        "args": {
+                            "channel_id": event_channel,
+                            "text": MANUAL_RELEASE_MESSAGE,
+                            "thread_ts": event_message_ts,
+                        },
+                    },
+                ],
+            )
+        return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
+
+
+class InvalidSlackMessageCrewRuntime:
+    def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001
+        if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
+            next_state = WorkflowState(
+                active_release=None,
+                previous_release_version=state.previous_release_version,
+                previous_release_completed_at=state.previous_release_completed_at,
+                processed_event_ids=[*state.processed_event_ids, "ev-invalid"],
+                completed_actions=dict(state.completed_actions),
+                checkpoints=list(state.checkpoints),
+            )
+            return CrewDecision(
+                next_step=ReleaseStep.IDLE,
+                next_state=next_state,
+                audit_reason="manual_override_to_idle",
+                tool_calls=[
+                    {
+                        "tool": "functions.slack_message",
+                        "reason": "confirm manual override",
+                    }
                 ],
             )
         return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
@@ -384,5 +457,59 @@ def test_runtime_executes_manual_release_confirmation_flow(tmp_path: Path, monke
     assert second_state.active_release.message_ts["manual_release_instruction"] == "1700000000.300000"
     assert "manual-release-instruction:5.104.0" in second_state.completed_actions
     assert "approval-confirmed-update:5.104.0:1700000000.200000" in second_state.completed_actions
+
+
+def test_runtime_failfast_on_slack_message_without_args_text(tmp_path: Path, monkeypatch) -> None:
+    memory_db = tmp_path / "crewai_memory.db"
+    audit_log = tmp_path / "workflow_audit.jsonl"
+    slack_events = tmp_path / "slack_events.jsonl"
+    sent_messages: list[tuple[str, str, str | None]] = []
+
+    def _fake_send_message(channel_id: str, text: str, thread_ts: str | None = None) -> dict[str, str]:
+        sent_messages.append((channel_id, text, thread_ts))
+        return {"message_ts": "1700000000.400000"}
+
+    config = RuntimeConfig(
+        slack_channel_id="C_DEFAULT",
+        slack_bot_token="xoxb-test-token",
+        timezone="Europe/Moscow",
+        heartbeat_active_minutes=15,
+        heartbeat_idle_minutes=240,
+        jira_project_keys=["IOS"],
+        readiness_owners={"Growth": "owner"},
+        memory_db_path=str(memory_db),
+        audit_log_path=str(audit_log),
+        slack_events_path=str(slack_events),
+        agent_pid_path=str(tmp_path / "agent.pid"),
+    )
+    memory = SQLiteMemory(db_path=str(memory_db))
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
+    monkeypatch.setattr(slack_gateway, "send_message", _fake_send_message)
+    workflow = ReleaseWorkflow(
+        config=config,
+        memory=memory,
+        slack_gateway=slack_gateway,
+        crew_runtime=InvalidSlackMessageCrewRuntime(),
+    )
+
+    _append_event(
+        slack_events,
+        {
+            "event_id": "ev-1",
+            "event_type": "manual_start",
+            "channel_id": "C0AGLKF6KHD",
+            "text": "override to idle",
+        },
+    )
+
+    previous_state = memory.load_state()
+    state = workflow.tick()
+    persisted_state = memory.load_state()
+    audit_rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    assert sent_messages == []
+    assert state.step == previous_state.step
+    assert persisted_state.step == previous_state.step
+    assert audit_rows[-1]["audit_reason"].startswith("invalid_tool_call:")
 
 

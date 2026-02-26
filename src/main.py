@@ -21,6 +21,7 @@ from .workflow_state import ReleaseStep
 
 app = typer.Typer(help="Coordinate release train workflow up to READY_FOR_BRANCH_CUT.")
 console = Console()
+MAX_SIGNAL_DRAIN_TICKS = 3
 
 
 def _configure_logging() -> None:
@@ -59,6 +60,17 @@ def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
     )
 
 
+def _pending_events_count(workflow: ReleaseWorkflow) -> int | None:
+    gateway = getattr(workflow, "slack_gateway", None)
+    counter = getattr(gateway, "pending_events_count", None)
+    if not callable(counter):
+        return None
+    try:
+        return int(counter())
+    except Exception:  # pragma: no cover - defensive logging helper
+        return None
+
+
 @app.command()
 def tick() -> None:
     """Execute one heartbeat tick."""
@@ -73,11 +85,13 @@ def run_heartbeat(iterations: int = typer.Option(0, help="0 means infinite loop.
     """Run the heartbeat loop."""
     _configure_logging()
     workflow, active_minutes, idle_minutes, agent_pid_path = _build_workflow()
-    trigger_event = False
+    pending_trigger_count = 0
+    last_signal_monotonic: float | None = None
 
     def _signal_handler(_signum, _frame) -> None:
-        nonlocal trigger_event
-        trigger_event = True
+        nonlocal pending_trigger_count, last_signal_monotonic
+        pending_trigger_count += 1
+        last_signal_monotonic = time.monotonic()
 
     signal.signal(signal.SIGUSR1, _signal_handler)
     agent_pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,20 +102,77 @@ def run_heartbeat(iterations: int = typer.Option(0, help="0 means infinite loop.
     run_count = 0
     try:
         while True:
-            state = workflow.tick()
+            trigger_reason = "heartbeat_timer"
+            signal_lag_seconds: float | None = None
+            if pending_trigger_count > 0:
+                pending_trigger_count -= 1
+                trigger_reason = "signal_trigger"
+                if last_signal_monotonic is not None:
+                    signal_lag_seconds = max(0.0, time.monotonic() - last_signal_monotonic)
+                logger.info(
+                    "starting triggered tick pending_after_dequeue=%s signal_lag_seconds=%s",
+                    pending_trigger_count,
+                    f"{signal_lag_seconds:.3f}" if signal_lag_seconds is not None else "unknown",
+                )
+
+            state = workflow.tick(trigger_reason=trigger_reason)
             run_count += 1
             console.print(f"[cyan]Heartbeat tick #{run_count} step={state.step.value}")
+            queue_remaining = _pending_events_count(workflow)
+            logger.info(
+                "tick complete reason=%s run=%s step=%s queue_remaining=%s pending_triggers=%s",
+                trigger_reason,
+                run_count,
+                state.step.value,
+                queue_remaining if queue_remaining is not None else "unknown",
+                pending_trigger_count,
+            )
+
+            if trigger_reason == "signal_trigger":
+                drain_runs = 0
+                while drain_runs < MAX_SIGNAL_DRAIN_TICKS:
+                    queue_remaining = _pending_events_count(workflow)
+                    if queue_remaining is None or queue_remaining <= 0:
+                        break
+                    if iterations and run_count >= iterations:
+                        break
+                    drain_runs += 1
+                    logger.info(
+                        "signal drain tick=%s/%s queue_remaining_before=%s",
+                        drain_runs,
+                        MAX_SIGNAL_DRAIN_TICKS,
+                        queue_remaining,
+                    )
+                    state = workflow.tick(trigger_reason="signal_drain")
+                    run_count += 1
+                    console.print(f"[cyan]Heartbeat tick #{run_count} step={state.step.value}")
+                    queue_after_drain = _pending_events_count(workflow)
+                    logger.info(
+                        "signal drain complete run=%s step=%s queue_remaining=%s",
+                        run_count,
+                        state.step.value,
+                        queue_after_drain if queue_after_drain is not None else "unknown",
+                    )
 
             if iterations and run_count >= iterations:
                 break
+
+            if pending_trigger_count > 0:
+                logger.info(
+                    "skip heartbeat sleep due pending triggers=%s",
+                    pending_trigger_count,
+                )
+                continue
 
             delay_minutes = idle_minutes if state.step == ReleaseStep.IDLE else active_minutes
             delay_seconds = delay_minutes * 60
             slept = 0.0
             while slept < delay_seconds:
-                if trigger_event:
-                    trigger_event = False
-                    logger.info("received immediate trigger via SIGUSR1")
+                if pending_trigger_count > 0:
+                    logger.info(
+                        "received immediate trigger via SIGUSR1 pending_triggers=%s",
+                        pending_trigger_count,
+                    )
                     break
                 chunk = min(1.0, delay_seconds - slept)
                 time.sleep(chunk)

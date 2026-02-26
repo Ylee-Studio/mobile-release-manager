@@ -13,6 +13,7 @@ from crewai.memory.long_term.long_term_memory import LTMSQLiteStorage, LongTermM
 from .agents import build_orchestrator_agent, build_release_manager_agent
 from .policies import PolicyConfig
 from .tasks import build_orchestrator_task, build_release_manager_task
+from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
 from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, SlackMessageTool, SlackUpdateTool
 from .workflow_state import ReleaseStep, WorkflowState
 
@@ -88,6 +89,7 @@ class CrewRuntimeCoordinator:
             SlackApproveTool(gateway=slack_gateway),
             SlackUpdateTool(gateway=slack_gateway),
         ]
+        self.tool_args_schema = {tool.name: tool.args_schema for tool in self.slack_tools}
 
     def decide(
         self,
@@ -115,7 +117,7 @@ class CrewRuntimeCoordinator:
                 agent=orchestrator_agent,
                 slack_tools=self.slack_tools,
             )
-            orchestrator_payload = self._run_crew(
+            orchestrator_payload, orchestrator_native_calls = self._run_crew(
                 agent=orchestrator_agent,
                 task=orchestrator_task,
                 payload=payload,
@@ -124,6 +126,10 @@ class CrewRuntimeCoordinator:
                 orchestrator_payload,
                 current_state=state,
                 actor="orchestrator",
+            )
+            orchestrator_decision.tool_calls = self._resolve_tool_calls(
+                payload=orchestrator_payload,
+                native_tool_calls=orchestrator_native_calls,
             )
 
             invoke_release_manager = _as_bool(orchestrator_payload.get("invoke_release_manager"))
@@ -144,7 +150,7 @@ class CrewRuntimeCoordinator:
                 agent=release_manager_agent,
                 slack_tools=self.slack_tools,
             )
-            release_manager_payload = self._run_crew(
+            release_manager_payload, release_manager_native_calls = self._run_crew(
                 agent=release_manager_agent,
                 task=release_manager_task,
                 payload={
@@ -157,9 +163,12 @@ class CrewRuntimeCoordinator:
                 current_state=orchestrator_decision.next_state,
                 actor="release_manager",
             )
+            release_manager_decision.tool_calls = self._resolve_tool_calls(
+                payload=release_manager_payload,
+                native_tool_calls=release_manager_native_calls,
+            )
             release_manager_decision.tool_calls = [
                 *orchestrator_decision.tool_calls,
-                {"tool": "release_manager_spawn", "reason": f"created_for:{release_version}"},
                 *release_manager_decision.tool_calls,
             ]
             release_manager_decision.audit_reason = (
@@ -185,7 +194,7 @@ class CrewRuntimeCoordinator:
             "metadata": event.metadata,
         }
 
-    def _run_crew(self, *, agent: Any, task: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    def _run_crew(self, *, agent: Any, task: Any, payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         crew = Crew(
             agents=[agent],
             tasks=[task],
@@ -197,7 +206,16 @@ class CrewRuntimeCoordinator:
             ),
         )
         result = crew.kickoff(inputs=payload)
-        return _extract_payload(result)
+        return _extract_payload(result), extract_native_tool_calls(result)
+
+    def _resolve_tool_calls(
+        self,
+        *,
+        payload: dict[str, Any],
+        native_tool_calls: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        source = native_tool_calls if native_tool_calls else payload.get("tool_calls", [])
+        return validate_and_normalize_tool_calls(source, schema_by_tool=self.tool_args_schema)
 
 
 def _extract_payload(result: Any) -> dict[str, Any]:

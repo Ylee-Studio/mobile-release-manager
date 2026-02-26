@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from crewai.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 @dataclass
@@ -89,6 +89,14 @@ class SlackGateway:
         if event is None:
             return []
         return [event]
+
+    def pending_events_count(self) -> int:
+        if not self.events_path.exists():
+            return 0
+        with self.events_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            return sum(1 for line in handle if line.strip())
 
     def _consume_one_event(self) -> SlackEvent | None:
         consumed_line = ""
@@ -177,9 +185,25 @@ class SlackGateway:
 
 
 class SlackMessageInput(BaseModel):
-    channel_id: str = Field(..., description="Target Slack channel id.")
-    text: str = Field(..., description="Message body.")
+    channel_id: str = Field(..., min_length=1, description="Target Slack channel id.")
+    text: str = Field(..., min_length=1, description="Message body.")
     thread_ts: str | None = Field(default=None, description="Optional thread ts.")
+
+    @field_validator("channel_id", "text")
+    @classmethod
+    def _strip_required(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must be non-empty")
+        return stripped
+
+    @field_validator("thread_ts")
+    @classmethod
+    def _strip_optional_thread_ts(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class SlackMessageTool(BaseTool):
@@ -194,9 +218,17 @@ class SlackMessageTool(BaseTool):
 
 
 class SlackApproveInput(BaseModel):
-    channel_id: str
-    text: str
-    approve_label: str = "Подтвердить"
+    channel_id: str = Field(..., min_length=1, description="Target Slack channel id.")
+    text: str = Field(..., min_length=1, description="Approval request text.")
+    approve_label: str = Field(default="Подтвердить", min_length=1, description="Button label.")
+
+    @field_validator("channel_id", "text", "approve_label")
+    @classmethod
+    def _strip_required(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must be non-empty")
+        return stripped
 
 
 class SlackApproveTool(BaseTool):
@@ -211,9 +243,17 @@ class SlackApproveTool(BaseTool):
 
 
 class SlackUpdateInput(BaseModel):
-    channel_id: str
-    message_ts: str
-    text: str
+    channel_id: str = Field(..., min_length=1, description="Target Slack channel id.")
+    message_ts: str = Field(..., min_length=1, description="Slack message ts to update.")
+    text: str = Field(..., min_length=1, description="Updated message text.")
+
+    @field_validator("channel_id", "message_ts", "text")
+    @classmethod
+    def _strip_required(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must be non-empty")
+        return stripped
 
 
 class SlackUpdateTool(BaseTool):

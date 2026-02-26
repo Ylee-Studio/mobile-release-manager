@@ -25,10 +25,14 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, audit_reason, and optional invoke_release_manager flag. "
+            "When you include tool_calls, always use canonical tool names "
+            "(`slack_message`, `slack_approve`, `slack_update`) without `functions.` prefix. "
+            "Each tool call must include `args` that fully match tool args_schema. "
             "Set invoke_release_manager=true only when an active release exists and the "
             "release manager must process release-specific side effects. Keep state "
             "consistent with ReleaseStep enum and preserve idempotency via "
-            "state.processed_event_ids and state.completed_actions."
+            "state.processed_event_ids and state.completed_actions. "
+            "Never emit `slack_message` tool calls without non-empty `args.text`."
         ),
     )
 
@@ -52,6 +56,8 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
         instructions=(
             "Always return strict JSON with next_step, next_state OR state_patch, "
             "tool_calls, and audit_reason. Use only the active release context and "
+            "use canonical tool names (`slack_message`, `slack_approve`, `slack_update`) "
+            "with `args` matching args_schema exactly. "
             "incoming events. Use `slack_approve` to request manual release confirmation "
             "before moving to JIRA_RELEASE_CREATED. For every approval_confirmed event, "
             "add a `slack_update` tool call that updates the original approval message, "

@@ -11,14 +11,19 @@ from typing import Any
 
 from .crew_memory import SQLiteMemory
 from .crew_runtime import CrewDecision, CrewRuntimeCoordinator
-from .tools.slack_tools import SlackGateway
+from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
+from .tools.slack_tools import (
+    SlackApproveInput,
+    SlackGateway,
+    SlackMessageInput,
+    SlackUpdateInput,
+)
 from .workflow_state import ReleaseStep, WorkflowState
 
 MANUAL_RELEASE_MESSAGE = (
     "Создайте релиз в https://instories.atlassian.net/jira/plans/1/scenarios/1/releases "
     "и проведите встречу фиксации релиза"
 )
-
 @dataclass
 class RuntimeConfig:
     slack_channel_id: str
@@ -53,9 +58,16 @@ class ReleaseWorkflow:
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("release_workflow")
 
-    def tick(self, *, now: datetime | None = None) -> WorkflowState:
+    def tick(
+        self,
+        *,
+        now: datetime | None = None,
+        trigger_reason: str = "heartbeat_timer",
+    ) -> WorkflowState:
         state = self.memory.load_state()
+        previous_state = WorkflowState.from_dict(state.to_dict())
         events = self.slack_gateway.poll_events()
+        queue_remaining = self.slack_gateway.pending_events_count()
         trace_id = str(uuid.uuid4())
 
         decision = self.crew_runtime.decide(
@@ -64,15 +76,40 @@ class ReleaseWorkflow:
             config=self.config,
             now=now,
         )
+        try:
+            decision.tool_calls = validate_and_normalize_tool_calls(
+                decision.tool_calls,
+                schema_by_tool={
+                    "slack_message": SlackMessageInput,
+                    "slack_approve": SlackApproveInput,
+                    "slack_update": SlackUpdateInput,
+                },
+            )
+        except ToolCallValidationError as exc:
+            self.logger.warning("tool_call validation failed: %s", exc)
+            decision = CrewDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason=f"invalid_tool_call:{exc}",
+                actor=decision.actor,
+                tool_calls=[],
+            )
         self._execute_tool_calls(decision=decision, events=events)
         next_state = decision.next_state
         self.memory.save_state(next_state, reason=decision.audit_reason)
         self._append_audit(
             trace_id=trace_id,
-            previous_state=state,
+            previous_state=previous_state,
             decision=decision,
             next_state=next_state,
             events=[_event_to_dict(event) for event in events],
+        )
+        self.logger.info(
+            "tick trace_id=%s reason=%s event_count=%s queue_remaining=%s",
+            trace_id,
+            trigger_reason,
+            len(events),
+            queue_remaining,
         )
         return next_state
 
@@ -116,11 +153,11 @@ class ReleaseWorkflow:
             if not isinstance(call, dict):
                 continue
             tool_name = str(call.get("tool", "")).strip()
-            if tool_name in {"slack_approve", "functions.slack_approve"}:
+            if tool_name == "slack_approve":
                 self._execute_slack_approve(call=call, decision=decision, events=events)
-            if tool_name in {"slack_message", "functions.slack_message"}:
+            if tool_name == "slack_message":
                 self._execute_slack_message(call=call, decision=decision, events=events)
-            if tool_name in {"slack_update", "functions.slack_update"}:
+            if tool_name == "slack_update":
                 self._execute_slack_update(call=call, decision=decision, events=events)
 
     def _execute_slack_approve(
@@ -208,45 +245,53 @@ class ReleaseWorkflow:
         events: list[Any],
     ) -> None:
         release = decision.next_state.active_release
-        if release is None:
-            return
+        args_raw = call.get("args", {})
+        args = args_raw if isinstance(args_raw, dict) else {}
         if decision.next_step == ReleaseStep.JIRA_RELEASE_CREATED:
+            if release is None:
+                return
             action_key = f"manual-release-instruction:{release.release_version}"
             message_key = "manual_release_instruction"
             text = MANUAL_RELEASE_MESSAGE
         else:
-            action_key = f"slack-message:{release.release_version}:{decision.next_step.value}"
-            message_key = "generic_message"
-            args_raw = call.get("args", {})
-            args = args_raw if isinstance(args_raw, dict) else {}
+            if release is not None:
+                action_key = f"slack-message:{release.release_version}:{decision.next_step.value}"
+                message_key = "generic_message"
+            else:
+                action_key = f"slack-message:global:{decision.next_step.value}"
+                message_key = ""
             text = str(args.get("text") or "").strip()
             if not text:
+                self.logger.warning("skip slack_message: empty text after validation")
                 return
         if decision.next_state.is_action_done(action_key):
             return
 
-        args_raw = call.get("args", {})
-        args = args_raw if isinstance(args_raw, dict) else {}
         channel_id = (
             str(args.get("channel_id") or "").strip()
-            or release.slack_channel_id
+            or (release.slack_channel_id if release else "")
             or _extract_event_channel_id(events)
             or self.config.slack_channel_id
         )
         if not channel_id:
-            self.logger.warning("skip slack_message: empty channel_id for release=%s", release.release_version)
+            release_version = release.release_version if release else "n/a"
+            self.logger.warning("skip slack_message: empty channel_id for release=%s", release_version)
             return
 
-        thread_ts = str(args.get("thread_ts") or "").strip() or release.thread_ts.get("manual_release_confirmation")
-        if not thread_ts:
+        thread_ts = str(args.get("thread_ts") or "").strip()
+        if not thread_ts and release is not None:
+            thread_ts = release.thread_ts.get("manual_release_confirmation")
+        if not thread_ts and release is not None:
             thread_ts = release.thread_ts.get("start_approval")
+        if not thread_ts:
+            thread_ts = _extract_latest_message_thread_ts(events)
         thread_ts_value = thread_ts or None
 
         decision.next_state.checkpoints.append(
             {
                 "phase": "before",
                 "tool": "slack_message",
-                "release_version": release.release_version,
+                "release_version": release.release_version if release else "",
                 "step": decision.next_step.value,
                 "at": datetime.now(timezone.utc).isoformat(),
             }
@@ -262,15 +307,16 @@ class ReleaseWorkflow:
             return
 
         message_ts = str(result.get("message_ts", "")).strip()
-        if message_ts:
+        if message_ts and release is not None and message_key:
             release.message_ts[message_key] = message_ts
-        release.slack_channel_id = channel_id
+        if release is not None:
+            release.slack_channel_id = channel_id
         decision.next_state.mark_action_done(action_key)
         decision.next_state.checkpoints.append(
             {
                 "phase": "after",
                 "tool": "slack_message",
-                "release_version": release.release_version,
+                "release_version": release.release_version if release else "",
                 "step": decision.next_step.value,
                 "at": datetime.now(timezone.utc).isoformat(),
             }
@@ -396,3 +442,18 @@ def _extract_latest_approval_event(events: list[Any]) -> Any | None:
         if str(getattr(event, "event_type", "")).strip() == "approval_confirmed":
             return event
     return None
+
+
+def _extract_latest_message_thread_ts(events: list[Any]) -> str:
+    for event in reversed(events):
+        if str(getattr(event, "event_type", "")).strip() != "message":
+            continue
+        thread_ts = str(getattr(event, "thread_ts", "") or "").strip()
+        if thread_ts:
+            return thread_ts
+        message_ts = str(getattr(event, "message_ts", "") or "").strip()
+        if message_ts:
+            return message_ts
+    return ""
+
+
