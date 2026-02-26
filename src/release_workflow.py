@@ -252,7 +252,6 @@ class ReleaseWorkflow:
         if release is None:
             return
         if decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION:
-            action_key = f"manual-release-confirmation-request:{release.release_version}"
             message_key = "manual_release_confirmation"
             default_text = (
                 f"Подтвердите, что релиз {release.release_version} создан вручную в Jira plan, "
@@ -260,15 +259,12 @@ class ReleaseWorkflow:
             )
             default_approve_label = "Релиз создан"
         else:
-            action_key = f"start-approval:{release.release_version}"
             message_key = "start_approval"
             default_text = (
                 f"Подтвердите старт релизного трейна {release.release_version}. "
                 "Если нужен другой номер для релиза, напишите в треде."
             )
             default_approve_label = "Подтвердить"
-        if decision.next_state.is_action_done(action_key):
-            return
 
         channel_id = release.slack_channel_id or _extract_event_channel_id(events) or self.config.slack_channel_id
         if not channel_id:
@@ -307,7 +303,6 @@ class ReleaseWorkflow:
         release.slack_channel_id = channel_id
         release.message_ts[message_key] = message_ts
         release.thread_ts[message_key] = message_ts
-        decision.next_state.mark_action_done(action_key)
         decision.next_state.checkpoints.append(
             {
                 "phase": "after",
@@ -336,17 +331,13 @@ class ReleaseWorkflow:
             text = MANUAL_RELEASE_MESSAGE
         else:
             if release is not None:
-                action_key = f"slack-message:{release.release_version}:{decision.next_step.value}"
                 message_key = "generic_message"
             else:
-                action_key = f"slack-message:global:{decision.next_step.value}"
                 message_key = ""
             text = str(args.get("text") or "").strip()
             if not text:
                 self.logger.warning("skip slack_message: empty text after validation")
                 return
-        if decision.next_state.is_action_done(action_key):
-            return
 
         channel_id = (
             str(args.get("channel_id") or "").strip()
@@ -392,7 +383,6 @@ class ReleaseWorkflow:
             release.message_ts[message_key] = message_ts
         if release is not None:
             release.slack_channel_id = channel_id
-        decision.next_state.mark_action_done(action_key)
         decision.next_state.checkpoints.append(
             {
                 "phase": "after",
@@ -421,10 +411,6 @@ class ReleaseWorkflow:
         message_ts = str(args.get("message_ts") or "").strip() or event_message_ts
         if not message_ts:
             self.logger.warning("skip slack_update: empty message_ts for release=%s", release.release_version)
-            return
-
-        action_key = f"approval-confirmed-update:{release.release_version}:{message_ts}"
-        if decision.next_state.is_action_done(action_key):
             return
 
         channel_id = (
@@ -468,7 +454,6 @@ class ReleaseWorkflow:
             return
 
         release.slack_channel_id = channel_id
-        decision.next_state.mark_action_done(action_key)
         decision.next_state.checkpoints.append(
             {
                 "phase": "after",

@@ -193,3 +193,37 @@ def test_release_manager_sessions_cleared_on_idle_transition(monkeypatch, tmp_pa
     second = coordinator.kickoff(state=first.next_state, events=[], config=_config())
     assert second.next_step == ReleaseStep.IDLE
     assert coordinator._release_manager_agents == {}
+
+
+def test_step_requires_release_manager_even_when_invoke_flag_false(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", lambda *, policies: object())
+    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent, slack_tools: {"task": "orchestrator"})
+    monkeypatch.setattr("src.crew_runtime.build_release_manager_agent", lambda *, policies, release_version: object())
+    monkeypatch.setattr("src.crew_runtime.build_release_manager_task", lambda *, agent, slack_tools: {"task": "release_manager"})
+
+    def _run_orchestrator(self, *, payload):  # noqa: ANN001
+        response = _orchestrator_payload(release_version="5.104.0", invoke_release_manager=False)
+        response["next_step"] = ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value
+        response["next_state"]["active_release"]["step"] = ReleaseStep.WAIT_READINESS_CONFIRMATIONS.value
+        return response, []
+
+    release_manager_calls = {"count": 0}
+
+    def _run_release_manager(self, *, agent, payload):  # noqa: ANN001
+        release_manager_calls["count"] += 1
+        return _release_manager_payload("5.104.0"), []
+
+    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_orchestrator", _run_orchestrator)
+    monkeypatch.setattr(CrewRuntimeCoordinator, "_run_release_manager", _run_release_manager)
+
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
+    coordinator = CrewRuntimeCoordinator(
+        policy=_policy(),
+        slack_gateway=gateway,
+        memory_db_path=str(tmp_path / "memory.db"),
+    )
+
+    decision = coordinator.kickoff(state=WorkflowState(), events=[], config=_config())
+
+    assert release_manager_calls["count"] == 1
+    assert decision.actor == "release_manager"

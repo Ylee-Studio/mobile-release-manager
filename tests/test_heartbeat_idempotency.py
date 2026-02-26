@@ -205,6 +205,62 @@ class InvalidSlackMessageCrewRuntime(_KickoffCompatibleRuntime):
         return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
 
 
+class ReadinessAnnouncementCrewRuntime(_KickoffCompatibleRuntime):
+    def decide(self, *, state: WorkflowState, events, config, now=None):  # noqa: ANN001, ARG002
+        readiness_text = (
+            "Релиз <https://instories.atlassian.net/issues/?jql=JQL|5.104.0>\n\n"
+            "Статус готовности к срезу:\n"
+            ":hourglass_flowing_sand: Growth @owner\n\n"
+            "Напишите в треде по готовности своей части.\n"
+            "**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
+            "едут в релиз только после одобрения QA"
+        )
+        if state.step == ReleaseStep.IDLE and any(e.event_type == "manual_start" for e in events):
+            return CrewDecision(
+                next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                next_state=WorkflowState(
+                    active_release=ReleaseContext(
+                        release_version="5.104.0",
+                        step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                        slack_channel_id="C0AGLKF6KHD",
+                    ),
+                    previous_release_version=state.previous_release_version,
+                    previous_release_completed_at=state.previous_release_completed_at,
+                    processed_event_ids=["ev-1"],
+                    completed_actions=dict(state.completed_actions),
+                    checkpoints=list(state.checkpoints),
+                ),
+                audit_reason="move_to_readiness",
+                tool_calls=[
+                    {
+                        "tool": "slack_message",
+                        "reason": "announce readiness",
+                        "args": {
+                            "channel_id": "C0AGLKF6KHD",
+                            "text": readiness_text,
+                        },
+                    }
+                ],
+            )
+        if state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
+            return CrewDecision(
+                next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                next_state=WorkflowState.from_dict(state.to_dict()),
+                audit_reason="repeat_readiness_announcement",
+                tool_calls=[
+                    {
+                        "tool": "slack_message",
+                        "reason": "repeat readiness status",
+                        "args": {
+                            "channel_id": "C0AGLKF6KHD",
+                            "text": readiness_text,
+                        },
+                    }
+                ],
+            )
+        return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
+
+
 def test_memory_state_persists_across_restarts(tmp_path: Path) -> None:
     memory_db = tmp_path / "crewai_memory.db"
     audit_log = tmp_path / "workflow_audit.jsonl"
@@ -307,7 +363,7 @@ def test_runtime_executes_slack_approve_tool_call(tmp_path: Path, monkeypatch) -
     assert state.active_release.message_ts["start_approval"] == "1700000000.123456"
     assert state.active_release.thread_ts["start_approval"] == "1700000000.123456"
     assert state.active_release.slack_channel_id == "C0AGLKF6KHD"
-    assert "start-approval:5.104.0" in state.completed_actions
+    assert state.completed_actions == {}
 
 
 def test_runtime_executes_manual_release_confirmation_flow(tmp_path: Path, monkeypatch) -> None:
@@ -391,7 +447,7 @@ def test_runtime_executes_manual_release_confirmation_flow(tmp_path: Path, monke
     assert first_state.active_release is not None
     assert first_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert first_state.active_release.message_ts["manual_release_confirmation"] == "1700000000.200000"
-    assert "manual-release-confirmation-request:5.104.0" in first_state.completed_actions
+    assert first_state.completed_actions == {}
 
     assert len(messages) == 1
     assert messages[0][0] == "C0AGLKF6KHD"
@@ -404,8 +460,7 @@ def test_runtime_executes_manual_release_confirmation_flow(tmp_path: Path, monke
     assert second_state.active_release is not None
     assert second_state.active_release.step == ReleaseStep.JIRA_RELEASE_CREATED
     assert second_state.active_release.message_ts["manual_release_instruction"] == "1700000000.300000"
-    assert "manual-release-instruction:5.104.0" in second_state.completed_actions
-    assert "approval-confirmed-update:5.104.0:1700000000.200000" in second_state.completed_actions
+    assert second_state.completed_actions == {}
 
 
 def test_runtime_failfast_on_slack_message_without_args_text(tmp_path: Path, monkeypatch) -> None:
@@ -460,6 +515,62 @@ def test_runtime_failfast_on_slack_message_without_args_text(tmp_path: Path, mon
     assert state.step == previous_state.step
     assert persisted_state.step == previous_state.step
     assert audit_rows[-1]["audit_reason"].startswith("invalid_tool_call:")
+
+
+def test_runtime_executes_readiness_message_without_deduplication(tmp_path: Path, monkeypatch) -> None:
+    memory_db = tmp_path / "crewai_memory.db"
+    audit_log = tmp_path / "workflow_audit.jsonl"
+    slack_events = tmp_path / "slack_events.jsonl"
+    sent_messages: list[tuple[str, str, str | None]] = []
+
+    def _fake_send_message(channel_id: str, text: str, thread_ts: str | None = None) -> dict[str, str]:
+        sent_messages.append((channel_id, text, thread_ts))
+        return {"message_ts": f"1700000000.4{len(sent_messages)}0000"}
+
+    config = RuntimeConfig(
+        slack_channel_id="C_DEFAULT",
+        slack_bot_token="xoxb-test-token",
+        timezone="Europe/Moscow",
+        heartbeat_active_minutes=15,
+        heartbeat_idle_minutes=240,
+        jira_project_keys=["IOS"],
+        readiness_owners={"Growth": "owner"},
+        memory_db_path=str(memory_db),
+        audit_log_path=str(audit_log),
+        slack_events_path=str(slack_events),
+        agent_pid_path=str(tmp_path / "agent.pid"),
+    )
+    memory = CrewAIMemory(db_path=str(memory_db))
+    slack_gateway = SlackGateway(bot_token="xoxb-test-token", events_path=slack_events)
+    monkeypatch.setattr(slack_gateway, "send_message", _fake_send_message)
+    workflow = ReleaseWorkflow(
+        config=config,
+        memory=memory,
+        slack_gateway=slack_gateway,
+        crew_runtime=ReadinessAnnouncementCrewRuntime(),
+    )
+
+    _append_event(
+        slack_events,
+        {
+            "event_id": "ev-1",
+            "event_type": "manual_start",
+            "channel_id": "C0AGLKF6KHD",
+            "text": "5.104.0",
+        },
+    )
+    first_state = workflow.tick()
+    second_state = workflow.tick()
+
+    assert first_state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+    assert second_state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+    assert len(sent_messages) == 2
+    assert sent_messages[0][0] == "C0AGLKF6KHD"
+    assert sent_messages[0][2] is None
+    assert "Статус готовности к срезу:" in sent_messages[0][1]
+    assert ":hourglass_flowing_sand: Growth @owner" in sent_messages[0][1]
+    assert "Напишите в треде по готовности своей части." in sent_messages[0][1]
+    assert sent_messages[1][1] == sent_messages[0][1]
 
 
 class CountingMemory:
@@ -637,7 +748,7 @@ def test_manual_transition_prunes_future_actions_and_replays_start_approval(tmp_
     assert state.active_release is not None
     assert state.active_release.step == ReleaseStep.WAIT_START_APPROVAL
     assert "manual-release-instruction:5.104.0" not in state.completed_actions
-    assert "start-approval:5.104.0" in state.completed_actions
+    assert "start-approval:5.104.0" not in state.completed_actions
     cleanup_checkpoints = [cp for cp in state.checkpoints if cp.get("tool") == "state_cleanup"]
     assert cleanup_checkpoints
     assert "start-approval:5.104.0" in cleanup_checkpoints[-1]["removed_completed_actions"]

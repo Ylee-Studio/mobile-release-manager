@@ -1,6 +1,6 @@
 from src.crew_runtime import CrewDecision
 from src.tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
-from src.tools.slack_tools import SlackApproveInput
+from src.tools.slack_tools import SlackApproveInput, SlackMessageInput
 from src.workflow_state import ReleaseStep, WorkflowState
 
 
@@ -177,6 +177,43 @@ def test_validation_normalizes_functions_alias_and_validates_args_schema() -> No
                 "channel_id": "C0AGLKF6KHD",
                 "text": "Подтвердите старт",
                 "approve_label": "Подтвердить",
+            },
+        }
+    ]
+
+
+def test_validation_accepts_readiness_slack_message_with_required_sections() -> None:
+    readiness_text = (
+        "Релиз <https://instories.atlassian.net/issues/?jql=JQL|5.104.0>\n\n"
+        "Статус готовности к срезу:\n"
+        ":hourglass_flowing_sand: Growth @owner\n\n"
+        "Напишите в треде по готовности своей части.\n"
+        "**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "едут в релиз только после одобрения QA"
+    )
+    tool_calls = [
+        {
+            "tool": "slack_message",
+            "reason": "announce readiness confirmation",
+            "args": {
+                "channel_id": " C0AGLKF6KHD ",
+                "text": f" {readiness_text} ",
+            },
+        }
+    ]
+
+    validated = validate_and_normalize_tool_calls(
+        tool_calls,
+        schema_by_tool={"slack_message": SlackMessageInput},
+    )
+
+    assert validated == [
+        {
+            "tool": "slack_message",
+            "reason": "announce readiness confirmation",
+            "args": {
+                "channel_id": "C0AGLKF6KHD",
+                "text": readiness_text,
             },
         }
     ]

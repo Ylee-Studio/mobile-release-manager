@@ -32,8 +32,8 @@ def build_orchestrator_agent(policies: PolicyConfig) -> Agent:
             "Each tool call must include `args` that fully match tool args_schema. "
             "Set invoke_release_manager=true only when an active release exists and the "
             "release manager must process release-specific side effects. Keep state "
-            "consistent with ReleaseStep enum and preserve idempotency via "
-            "state.processed_event_ids and state.completed_actions. "
+            "consistent with ReleaseStep enum and track incoming events using "
+            "state.processed_event_ids. "
             "Never emit `slack_message` tool calls without non-empty `args.text`."
         ),
     )
@@ -69,12 +69,17 @@ def build_release_manager_agent(policies: PolicyConfig, release_version: str) ->
             "`slack_message` to notify the channel about manual Jira release creation "
             "and release-fixation meeting. "
             "When moving to WAIT_READINESS_CONFIRMATIONS, always include exactly one "
-            "`slack_message` tool call with a non-empty readiness text built from "
-            "config.readiness_owners (one :hourglass_flowing_sand: line per team). "
+            "`slack_message` tool call with non-empty `args.channel_id` and `args.text`. "
+            "The readiness text must follow this format: "
+            "'Релиз <https://instories.atlassian.net/issues/?jql=JQL|X.Y.Z>' line, blank line, "
+            "'Статус готовности к срезу:' line, one ':hourglass_flowing_sand: <Team> <Owner>' "
+            "line per team from config.readiness_owners, blank line, "
+            "'Напишите в треде по готовности своей части.' line, and "
+            "'**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
+            "едут в релиз только после одобрения QA'. "
             "If you cannot produce that message, do not move to WAIT_READINESS_CONFIRMATIONS. "
             "When tools return message_ts, persist it into "
             "next_state.active_release.message_ts/thread_ts where applicable. "
-            "Never duplicate side effects when state.completed_actions indicates "
-            "an action already happened."
+            "Do not skip valid tool calls based on previously completed actions."
         ),
     )

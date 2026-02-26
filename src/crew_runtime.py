@@ -212,6 +212,8 @@ class CrewRuntimeCoordinator:
             orchestrator_payload = context.orchestrator_payload
             orchestrator_decision = context.orchestrator_decision
             invoke_release_manager = _as_bool(orchestrator_payload.get("invoke_release_manager"))
+            if _step_requires_release_manager(orchestrator_decision.next_step):
+                invoke_release_manager = True
             release_version = (
                 orchestrator_decision.next_state.active_release.release_version
                 if orchestrator_decision.next_state.active_release
@@ -443,3 +445,14 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return False
+
+
+def _step_requires_release_manager(step: ReleaseStep) -> bool:
+    return step in {
+        ReleaseStep.RELEASE_MANAGER_CREATED,
+        ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+        ReleaseStep.JIRA_RELEASE_CREATED,
+        ReleaseStep.WAIT_MEETING_CONFIRMATION,
+        ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+        ReleaseStep.READY_FOR_BRANCH_CUT,
+    }
