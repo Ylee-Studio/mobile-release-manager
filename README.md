@@ -1,16 +1,15 @@
-# Release Manager Crew
+# Release Manager Runtime
 
-CrewAI-based release workflow runner with heartbeat orchestration, Slack event ingestion, and persisted workflow state.
+Pydantic + deterministic state machine release workflow runner with event-driven webhook processing, Slack event ingestion, and persisted workflow state.
 
 ## Capabilities
-- CrewAI Flow runtime (`Flow + Crew + Process.sequential`) for orchestrator/release-manager turns.
-- Persistent state snapshots via CrewAI memory adapter (`CrewAIMemory`).
-- Heartbeat loop with immediate signal trigger support (`SIGUSR1`) for fast event processing.
+- Deterministic gates via state machine before runtime decisions.
+- Persistent state snapshots via local JSONL state store.
+- Event-driven processing: each persisted Slack event immediately triggers one workflow turn.
 - Audit trail in `artifacts/workflow_audit.jsonl`.
 
 ## Runtime Commands
 - One tick: `python -m src.main tick`
-- Continuous heartbeat: `python -m src.main run-heartbeat`
 - Slack webhook ingress: `python -m src.main run-slack-webhook`
 
 ## Environment
@@ -24,7 +23,6 @@ Optional:
 
 ## Configuration
 Main runtime config lives in `config.yaml`:
-- `workflow.heartbeat` for active/idle intervals
 - `workflow.storage` for memory/audit/events paths
 - `workflow.readiness_owners` for readiness map
 - `slack` for channel/token resolution
@@ -32,8 +30,8 @@ Main runtime config lives in `config.yaml`:
 
 ## Development
 - Run targeted tests:
-  - `python -m pytest tests/test_heartbeat_idempotency.py`
-  - `python -m pytest tests/test_crew_runtime_sessions.py`
-  - `python -m pytest tests/test_flow_crew_pipeline.py`
+  - `python -m pytest tests/test_event_driven_idempotency.py`
+  - `python -m pytest tests/test_runtime_sessions.py`
+  - `python -m pytest tests/test_flow_runtime_pipeline.py`
 - Full test run:
   - `python -m pytest`

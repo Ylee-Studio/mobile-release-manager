@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Dict
 
-from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
 
@@ -20,17 +18,15 @@ class NotionInput(BaseModel):
     )
 
 
-class NotionReleaseTool(BaseTool):
+class NotionReleaseTool(BaseModel):
     """Lightweight proxy that pretends to query a Notion release process page."""
 
     name: str = "notion_release_tool"
     description: str = "Reads the release checklist steps from Notion and returns structured items."
-    args_schema: type[BaseModel] = NotionInput
-
     release_doc_url: str
     database_id: str
 
-    def _run(self, action: str = "fetch_checklist", page_id: str | None = None) -> Dict[str, Any]:
+    def run(self, action: str = "fetch_checklist", page_id: str | None = None) -> Dict[str, Any]:
         if action == "fetch_checklist":
             return self._mock_checklist()
         if action == "fetch_page":

@@ -1,4 +1,4 @@
-from src.crew_runtime import CrewDecision
+from src.runtime_engine import RuntimeDecision
 from src.tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
 from src.tools.slack_tools import SlackApproveInput, SlackMessageInput
 from src.workflow_state import ReleaseStep, WorkflowState
@@ -20,7 +20,7 @@ def test_decision_accepts_full_next_state() -> None:
         "tool_calls": [{"tool": "slack_approve", "reason": "request approval"}],
         "audit_reason": "new_release_started",
     }
-    decision = CrewDecision.from_payload(payload, current_state=WorkflowState())
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState())
     assert decision.next_step == ReleaseStep.WAIT_START_APPROVAL
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "2.0.0"
@@ -38,12 +38,12 @@ def test_decision_supports_state_patch_merge() -> None:
         "state_patch": {"pause_reason": "patched"},
         "audit_reason": "mark_event_processed",
     }
-    decision = CrewDecision.from_payload(payload, current_state=current)
+    decision = RuntimeDecision.from_payload(payload, current_state=current)
     assert decision.next_step == ReleaseStep.IDLE
     assert decision.next_state.pause_reason == "patched"
 
 
-def test_decision_keeps_two_agent_contract_fields() -> None:
+def test_decision_keeps_single_agent_contract_fields() -> None:
     payload = {
         "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
         "next_state": {
@@ -57,12 +57,11 @@ def test_decision_keeps_two_agent_contract_fields() -> None:
             "checkpoints": [],
         },
         "tool_calls": [{"tool": "slack_update", "reason": "prepare release manager phase"}],
-        "audit_reason": "orchestrator_ready_for_release_manager",
-        "invoke_release_manager": True,
+        "audit_reason": "flow_agent_transition",
     }
 
-    decision = CrewDecision.from_payload(payload, current_state=WorkflowState(), actor="orchestrator")
-    assert decision.actor == "orchestrator"
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState(), actor="flow_agent")
+    assert decision.actor == "flow_agent"
     assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "3.1.0"
@@ -83,7 +82,7 @@ def test_decision_accepts_active_release_aliases_from_agent() -> None:
         "audit_reason": "manual_start_processed",
     }
 
-    decision = CrewDecision.from_payload(payload, current_state=WorkflowState())
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState())
     assert decision.next_step == ReleaseStep.WAIT_START_APPROVAL
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "5.104.0"
@@ -105,11 +104,71 @@ def test_decision_accepts_manual_release_confirmation_alias_from_agent() -> None
         "audit_reason": "manual_release_confirmation_requested",
     }
 
-    decision = CrewDecision.from_payload(payload, current_state=WorkflowState())
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState())
     assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert decision.next_state.active_release is not None
     assert decision.next_state.active_release.release_version == "5.104.0"
     assert decision.next_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+
+
+def test_decision_normalizes_string_active_release_in_state_patch() -> None:
+    payload = {
+        "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
+        "state_patch": {
+            "active_release": "5.105.0",
+            "flow_execution_id": "exec-5.105.0",
+            "flow_paused_at": "2026-02-27T06:51:41.471780+00:00",
+            "pause_reason": "Waiting for manual release confirmation",
+        },
+        "tool_calls": [],
+        "audit_reason": "Manual start event received, transition to wait for manual release confirmation",
+    }
+
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState())
+    assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.next_state.active_release is not None
+    assert decision.next_state.active_release.release_version == "5.105.0"
+    assert decision.next_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.next_state.flow_execution_id == "exec-5.105.0"
+    assert decision.tool_calls == []
+
+
+def test_decision_normalizes_string_active_release_in_next_state_wait_manual() -> None:
+    payload = {
+        "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
+        "next_state": {
+            "active_release": "5.105.0",
+            "flow_execution_id": "exec-5.105.0",
+            "flow_paused_at": "2026-02-27T07:04:16.584921+00:00",
+            "pause_reason": "Waiting for manual release confirmation.",
+            "checkpoints": [],
+        },
+        "tool_calls": [],
+        "audit_reason": "Received manual_start event for release 5.105.0, starting release flow and pausing for manual confirmation",
+    }
+
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState())
+    assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.next_state.active_release is not None
+    assert decision.next_state.active_release.release_version == "5.105.0"
+    assert decision.next_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.next_state.flow_execution_id == "exec-5.105.0"
+    assert decision.tool_calls == []
+
+
+def test_decision_normalizes_string_active_release_in_next_state_idle() -> None:
+    payload = {
+        "next_step": "IDLE",
+        "next_state": {
+            "active_release": "5.105.0",
+            "checkpoints": [],
+        },
+        "audit_reason": "release_completed",
+    }
+
+    decision = RuntimeDecision.from_payload(payload, current_state=WorkflowState())
+    assert decision.next_step == ReleaseStep.IDLE
+    assert decision.next_state.active_release is None
 
 
 def test_native_tool_call_extraction_from_canonical_payload() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.crew_runtime import CrewDecision, CrewRuntimeCoordinator
+from src.runtime_engine import RuntimeCoordinator, RuntimeDecision
 from src.policies import PolicyConfig
 from src.tools.slack_tools import SlackEvent, SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
@@ -21,13 +21,10 @@ def _config() -> SimpleNamespace:
     )
 
 
-def _build_coordinator(monkeypatch, tmp_path) -> CrewRuntimeCoordinator:
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", lambda *, policies: object())
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent: {"task": "orchestrator"})
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_agent", lambda *, policies, release_version: object())
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_task", lambda *, agent: {"task": "release_manager"})
+def _build_coordinator(monkeypatch, tmp_path) -> RuntimeCoordinator:
+    _ = monkeypatch
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
-    return CrewRuntimeCoordinator(
+    return RuntimeCoordinator(
         policy=_policy(),
         slack_gateway=gateway,
         memory_db_path=str(tmp_path / "memory.db"),
@@ -41,7 +38,7 @@ def test_paused_flow_without_confirmation_event_does_not_execute(monkeypatch, tm
     class _FlowStub:
         def kickoff(self, *, inputs):  # noqa: ANN001
             flow_calls["kickoff"] += 1
-            return CrewDecision(next_step=ReleaseStep.IDLE, next_state=WorkflowState())
+            return RuntimeDecision(next_step=ReleaseStep.IDLE, next_state=WorkflowState())
 
     coordinator.flow = _FlowStub()
     state = WorkflowState(
@@ -65,7 +62,7 @@ def test_paused_flow_with_confirmation_event_runs_kickoff(monkeypatch, tmp_path)
         def kickoff(self, *, inputs):  # noqa: ANN001
             _ = inputs
             flow_calls["kickoff"] += 1
-            return CrewDecision(
+            return RuntimeDecision(
                 next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
                 next_state=WorkflowState(
                     active_release=ReleaseContext(
@@ -129,3 +126,47 @@ def test_resume_from_pending_uses_from_pending_flow(monkeypatch, tmp_path) -> No
     assert called["resume"] == 1
     assert decision.flow_lifecycle == "running"
     assert decision.audit_reason == "resume_dispatched"
+
+
+def test_resolve_tool_calls_prefers_payload_list_over_partial_native(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    payload = {
+        "tool_calls": [
+            {
+                "tool": "slack_update",
+                "reason": "update trigger message",
+                "args": {
+                    "channel_id": "C0AGLKF6KHD",
+                    "message_ts": "1772178090.522069",
+                    "text": "Подтвердите создание релиза 5.104.0 в JIRA",
+                },
+            },
+            {
+                "tool": "slack_approve",
+                "reason": "request meeting confirmation",
+                "args": {
+                    "channel_id": "C0AGLKF6KHD",
+                    "text": "Подтвердите, что встреча фиксации релиза уже прошла.",
+                    "approve_label": "Подтвердить",
+                },
+            },
+        ]
+    }
+    native_tool_calls = [
+        {
+            "tool": "slack_update",
+            "reason": "native partial",
+            "args": {
+                "channel_id": "C0AGLKF6KHD",
+                "message_ts": "1772178090.522069",
+                "text": "Подтвердите создание релиза 5.104.0 в JIRA",
+            },
+        }
+    ]
+
+    resolved = coordinator._resolve_tool_calls(  # noqa: SLF001 - explicit regression test for internal policy
+        payload=payload,
+        native_tool_calls=native_tool_calls,
+    )
+
+    assert [call["tool"] for call in resolved] == ["slack_update", "slack_approve"]

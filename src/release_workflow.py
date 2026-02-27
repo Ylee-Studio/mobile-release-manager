@@ -1,4 +1,4 @@
-"""Release workflow runtime driven by Crew decisions."""
+"""Release workflow runtime driven by deterministic state machine."""
 from __future__ import annotations
 
 import json
@@ -11,9 +11,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from crewai import Memory
-
-from .crew_runtime import CrewDecision, CrewRuntimeCoordinator
+from .runtime_engine import RuntimeCoordinator, RuntimeDecision
+from .state_machine import (
+    StateMachineEngine,
+    extract_latest_approval_event,
+    has_approval_confirmed,
+    pending_key_from_event,
+)
+from .state_store import WorkflowStateStore
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
 from .tools.slack_tools import (
     SlackApproveInput,
@@ -30,14 +35,11 @@ class RuntimeConfig:
     slack_channel_id: str
     slack_bot_token: str
     timezone: str
-    heartbeat_active_minutes: int
-    heartbeat_idle_minutes: int
     jira_project_keys: list[str]
     readiness_owners: dict[str, str]
     memory_db_path: str
     audit_log_path: str
     slack_events_path: str
-    agent_pid_path: str
 
 
 WORKFLOW_STATE_KEY = "release_workflow_state"
@@ -47,30 +49,35 @@ WORKFLOW_MEMORY_CATEGORY = "workflow_state"
 
 
 class ReleaseWorkflow:
-    """Thin runtime that delegates release decisions to Crew."""
+    """Thin runtime that delegates transitions to state machine + runtime engine."""
 
     def __init__(
         self,
         *,
         config: RuntimeConfig,
-        memory: Memory,
         slack_gateway: SlackGateway,
-        crew_runtime: CrewRuntimeCoordinator | Any,
+        state_store: WorkflowStateStore | Any | None = None,
+        memory: Any | None = None,
+        runtime_engine: RuntimeCoordinator | Any | None = None,
+        legacy_runtime: RuntimeCoordinator | Any | None = None,
     ):
         self.config = config
-        self.memory = memory
+        self.state_store = state_store or _build_legacy_state_store(memory=memory, fallback_path=config.memory_db_path)
         self.slack_gateway = slack_gateway
-        self.crew_runtime = crew_runtime
+        self.runtime_engine = runtime_engine or legacy_runtime
+        if self.runtime_engine is None:
+            raise RuntimeError("runtime engine is required")
+        self.state_machine = StateMachineEngine()
         self.audit_log_path = Path(config.audit_log_path)
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("release_workflow")
-        self._state = _load_state_from_memory(self.memory)
+        self._state = self.state_store.load()
 
     def tick(
         self,
         *,
         now: datetime | None = None,
-        trigger_reason: str = "heartbeat_timer",
+        trigger_reason: str = "event_trigger",
     ) -> WorkflowState:
         state = WorkflowState.from_dict(self._state.to_dict())
         previous_state = WorkflowState.from_dict(state.to_dict())
@@ -96,7 +103,7 @@ class ReleaseWorkflow:
             )
         except ToolCallValidationError as exc:
             self.logger.warning("tool_call validation failed: %s", exc)
-            decision = CrewDecision(
+            decision = RuntimeDecision(
                 next_step=state.step,
                 next_state=state,
                 audit_reason=f"invalid_tool_call:{exc}",
@@ -105,7 +112,7 @@ class ReleaseWorkflow:
             )
         self._execute_tool_calls(decision=decision, events=events)
         next_state = decision.next_state
-        _save_state_to_memory(self.memory, next_state, reason=decision.audit_reason)
+        self.state_store.save(state=next_state, reason=decision.audit_reason)
         self._state = WorkflowState.from_dict(next_state.to_dict())
         self._append_audit(
             trace_id=trace_id,
@@ -130,28 +137,35 @@ class ReleaseWorkflow:
         events: list[Any],
         now: datetime | None,
         trigger_reason: str,
-    ) -> CrewDecision:
-        readiness_gate_decision = self._handle_wait_readiness_confirmations_gate(
+    ) -> RuntimeDecision:
+        gate_outcome = self.state_machine.apply_deterministic_gates(
             state=state,
             events=events,
+            readiness_owners=self.config.readiness_owners,
         )
-        if readiness_gate_decision is not None:
-            return readiness_gate_decision
+        if gate_outcome is not None:
+            return RuntimeDecision(
+                next_step=gate_outcome.next_step,
+                next_state=gate_outcome.next_state,
+                audit_reason=gate_outcome.audit_reason,
+                actor=gate_outcome.actor,
+                flow_lifecycle=gate_outcome.flow_lifecycle,
+            )
 
-        if state.is_paused and _has_approval_confirmed(events):
-            approval_event = _extract_latest_approval_event(events)
-            pending_key = _pending_key_from_event(approval_event)
+        if state.is_paused and has_approval_confirmed(events):
+            approval_event = extract_latest_approval_event(events)
+            pending_key = pending_key_from_event(approval_event)
             flow_id = str(state.flow_execution_id or "").strip()
             if not flow_id:
-                return CrewDecision(
+                return RuntimeDecision(
                     next_step=state.step,
                     next_state=state,
                     audit_reason=f"flow_id_lookup_status:missing;pending_key:{pending_key}",
                     actor="flow_runtime",
                     flow_lifecycle="paused",
                 )
-            feedback = str(getattr(_extract_latest_approval_event(events), "text", "") or "").strip()
-            resume_decision = self.crew_runtime.resume_from_pending(
+            feedback = str(getattr(extract_latest_approval_event(events), "text", "") or "").strip()
+            resume_decision = self.runtime_engine.resume_from_pending(
                 flow_id=flow_id,
                 feedback=feedback,
                 state=state,
@@ -182,79 +196,26 @@ class ReleaseWorkflow:
         events: list[Any],
         now: datetime | None,
         trigger_reason: str,
-    ) -> CrewDecision:
-        return self.crew_runtime.kickoff(
-            state=state,
-            events=events,
-            config=self.config,
-            now=now,
-            trigger_reason=trigger_reason,
-        )
-
-    def _handle_wait_readiness_confirmations_gate(
-        self,
-        *,
-        state: WorkflowState,
-        events: list[Any],
-    ) -> CrewDecision | None:
-        release = state.active_release
-        if not state.is_paused or release is None:
-            return None
-        if state.step != ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
-            return None
-
-        readiness_owners = self.config.readiness_owners or {}
-        required_points = list(readiness_owners.keys())
-        if not required_points:
-            return None
-
-        next_state = WorkflowState.from_dict(state.to_dict())
-        next_release = next_state.active_release
-        if next_release is None:
-            return None
-
-        readiness_map = _normalize_readiness_map(
-            readiness_map=next_release.readiness_map,
-            required_points=required_points,
-        )
-        readiness_thread_ts = _readiness_thread_ts(next_release)
-        for event in events:
-            if not _is_readiness_thread_message(event=event, readiness_thread_ts=readiness_thread_ts):
-                continue
-            text = str(getattr(event, "text", "") or "").strip()
-            if not _is_readiness_confirmation_text(text):
-                continue
-            metadata = getattr(event, "metadata", None)
-            confirmed_points = _extract_confirmed_readiness_points(
-                text=text,
-                readiness_owners=readiness_owners,
-                metadata=metadata,
+    ) -> RuntimeDecision:
+        kickoff = getattr(self.runtime_engine, "kickoff", None)
+        if callable(kickoff):
+            return kickoff(
+                state=state,
+                events=events,
+                config=self.config,
+                now=now,
+                trigger_reason=trigger_reason,
             )
-            for point in confirmed_points:
-                readiness_map[point] = True
-
-        next_release.readiness_map = readiness_map
-        confirmed_total = sum(1 for point in required_points if readiness_map.get(point) is True)
-        required_total = len(required_points)
-        if confirmed_total < required_total:
-            return CrewDecision(
-                next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
-                next_state=next_state,
-                audit_reason=f"readiness_confirmations_progress:{confirmed_total}/{required_total}",
-                actor="flow_runtime",
-                flow_lifecycle="paused",
+        decide = getattr(self.runtime_engine, "decide", None)
+        if callable(decide):
+            return decide(
+                state=state,
+                events=events,
+                config=self.config,
+                now=now,
+                trigger_reason=trigger_reason,
             )
-
-        next_release.set_step(ReleaseStep.READY_FOR_BRANCH_CUT)
-        next_state.flow_paused_at = None
-        next_state.pause_reason = None
-        return CrewDecision(
-            next_step=ReleaseStep.READY_FOR_BRANCH_CUT,
-            next_state=next_state,
-            audit_reason=f"readiness_confirmations_complete:{confirmed_total}/{required_total}",
-            actor="flow_runtime",
-            flow_lifecycle="running",
-        )
+        raise RuntimeError("runtime engine must provide kickoff() or decide()")
 
     def resume_on_event(
         self,
@@ -263,11 +224,10 @@ class ReleaseWorkflow:
         events: list[Any],
         now: datetime | None,
         trigger_reason: str,
-    ) -> CrewDecision:
-        return self.crew_runtime.kickoff(
+    ) -> RuntimeDecision:
+        return self.start_or_continue_release(
             state=state,
             events=events,
-            config=self.config,
             now=now,
             trigger_reason=trigger_reason,
         )
@@ -297,7 +257,7 @@ class ReleaseWorkflow:
         *,
         trace_id: str,
         previous_state: WorkflowState,
-        decision: CrewDecision,
+        decision: RuntimeDecision,
         next_state: WorkflowState,
         events: list[dict[str, Any]],
     ) -> None:
@@ -332,7 +292,7 @@ class ReleaseWorkflow:
             incoming_slack_messages,
         )
 
-    def _execute_tool_calls(self, *, decision: CrewDecision, events: list[Any]) -> None:
+    def _execute_tool_calls(self, *, decision: RuntimeDecision, events: list[Any]) -> None:
         for call in decision.tool_calls:
             if not isinstance(call, dict):
                 continue
@@ -348,7 +308,7 @@ class ReleaseWorkflow:
         self,
         *,
         call: dict[str, Any],
-        decision: CrewDecision,
+        decision: RuntimeDecision,
         events: list[Any],
     ) -> None:
         release = decision.next_state.active_release
@@ -424,7 +384,7 @@ class ReleaseWorkflow:
         self,
         *,
         call: dict[str, Any],
-        decision: CrewDecision,
+        decision: RuntimeDecision,
         events: list[Any],
     ) -> None:
         release = decision.next_state.active_release
@@ -514,7 +474,7 @@ class ReleaseWorkflow:
         self,
         *,
         call: dict[str, Any],
-        decision: CrewDecision,
+        decision: RuntimeDecision,
         events: list[Any],
     ) -> None:
         release = decision.next_state.active_release
@@ -582,57 +542,70 @@ class ReleaseWorkflow:
         )
 
 
-def _load_state_from_memory(memory: Memory) -> WorkflowState:
-    try:
-        matches = memory.recall(
-            query=WORKFLOW_STATE_KEY,
-            scope=WORKFLOW_MEMORY_SCOPE,
-            categories=[WORKFLOW_MEMORY_CATEGORY],
-            limit=100,
-            depth="shallow",
-            source=WORKFLOW_MEMORY_SOURCE,
-        )
-    except Exception:
+class _LegacyMemoryStateStore:
+    """Adapter to keep backward compatibility with legacy in-memory tests."""
+
+    def __init__(self, *, memory: Any):
+        self.memory = memory
+
+    def load(self) -> WorkflowState:
+        if self.memory is None:
+            return WorkflowState()
+        try:
+            matches = self.memory.recall(
+                query=WORKFLOW_STATE_KEY,
+                scope=WORKFLOW_MEMORY_SCOPE,
+                categories=[WORKFLOW_MEMORY_CATEGORY],
+                limit=100,
+                depth="shallow",
+                source=WORKFLOW_MEMORY_SOURCE,
+            )
+        except Exception:
+            return WorkflowState()
+        if not isinstance(matches, list):
+            return WorkflowState()
+        for match in matches:
+            record = getattr(match, "record", None)
+            if record is None and isinstance(match, dict):
+                entry = match
+            else:
+                entry = {
+                    "content": getattr(record, "content", ""),
+                    "metadata": getattr(record, "metadata", {}),
+                }
+            raw_state = _extract_workflow_state(entry)
+            if isinstance(raw_state, dict):
+                return WorkflowState.from_dict(raw_state)
         return WorkflowState()
 
-    if not isinstance(matches, list):
-        return WorkflowState()
+    def save(self, *, state: WorkflowState, reason: str) -> None:
+        if self.memory is None:
+            return
+        state_payload = state.to_dict()
+        metadata: dict[str, Any] = {
+            "state_key": WORKFLOW_STATE_KEY,
+            "state": state_payload,
+            "reason": reason,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        content = json.dumps(state_payload, ensure_ascii=True)
+        try:
+            self.memory.remember(
+                content=content,
+                scope=WORKFLOW_MEMORY_SCOPE,
+                categories=[WORKFLOW_MEMORY_CATEGORY],
+                metadata=metadata,
+                importance=1.0,
+                source=WORKFLOW_MEMORY_SOURCE,
+            )
+        except Exception:
+            return
 
-    for match in matches:
-        record = getattr(match, "record", None)
-        if record is None and isinstance(match, dict):
-            entry = match
-        else:
-            entry = {
-                "content": getattr(record, "content", ""),
-                "metadata": getattr(record, "metadata", {}),
-            }
-        raw_state = _extract_workflow_state(entry)
-        if isinstance(raw_state, dict):
-            return WorkflowState.from_dict(raw_state)
-    return WorkflowState()
 
-
-def _save_state_to_memory(memory: Memory, state: WorkflowState, *, reason: str) -> None:
-    state_payload = state.to_dict()
-    metadata: dict[str, Any] = {
-        "state_key": WORKFLOW_STATE_KEY,
-        "state": state_payload,
-        "reason": reason,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-    }
-    content = json.dumps(state_payload, ensure_ascii=True)
-    try:
-        memory.remember(
-            content=content,
-            scope=WORKFLOW_MEMORY_SCOPE,
-            categories=[WORKFLOW_MEMORY_CATEGORY],
-            metadata=metadata,
-            importance=1.0,
-            source=WORKFLOW_MEMORY_SOURCE,
-        )
-    except Exception:
-        return
+def _build_legacy_state_store(*, memory: Any | None, fallback_path: str) -> Any:
+    if memory is not None and hasattr(memory, "remember") and hasattr(memory, "recall"):
+        return _LegacyMemoryStateStore(memory=memory)
+    return WorkflowStateStore(state_path=fallback_path)
 
 
 def _extract_workflow_state(entry: dict[str, Any]) -> dict[str, Any] | None:

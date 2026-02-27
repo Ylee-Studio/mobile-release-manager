@@ -1,7 +1,6 @@
 """Workflow state models for release train orchestration."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -49,30 +48,28 @@ def _coerce_step(value: Any, *, fallback: ReleaseStep) -> ReleaseStep:
     return fallback
 
 
-@dataclass
-class ReleaseContext:
+class ReleaseContext(BaseModel):
     release_version: str
     step: ReleaseStep
-    updated_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
     slack_channel_id: str | None = None
-    message_ts: dict[str, str] = field(default_factory=dict)
-    thread_ts: dict[str, str] = field(default_factory=dict)
-    readiness_map: dict[str, bool] = field(default_factory=dict)
+    message_ts: dict[str, str] = Field(default_factory=dict)
+    thread_ts: dict[str, str] = Field(default_factory=dict)
+    readiness_map: dict[str, bool] = Field(default_factory=dict)
 
     def set_step(self, step: ReleaseStep) -> None:
         self.step = step
         self.updated_at = utc_now_iso()
 
 
-@dataclass
-class WorkflowState:
+class WorkflowState(BaseModel):
     active_release: ReleaseContext | None = None
     previous_release_version: str | None = None
     previous_release_completed_at: str | None = None
     flow_execution_id: str | None = None
     flow_paused_at: str | None = None
     pause_reason: str | None = None
-    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    checkpoints: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def step(self) -> ReleaseStep:
@@ -87,7 +84,7 @@ class WorkflowState:
     def to_dict(self) -> dict[str, Any]:
         active = None
         if self.active_release:
-            active = asdict(self.active_release)
+            active = self.active_release.model_dump()
             active["step"] = self.active_release.step.value
         return {
             "active_release": active,
@@ -153,5 +150,5 @@ class ReleaseFlowState(BaseModel):
     state: dict[str, Any] = Field(default_factory=dict)
     events: list[dict[str, Any]] = Field(default_factory=list)
     config: dict[str, Any] = Field(default_factory=dict)
-    trigger_reason: str = "heartbeat_timer"
+    trigger_reason: str = "event_trigger"
     now_iso: str = ""

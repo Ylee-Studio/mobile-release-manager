@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.crew_runtime import CrewDecision
+from src.runtime_engine import RuntimeDecision
 from src.release_workflow import ReleaseWorkflow, RuntimeConfig
 from src.tools.slack_tools import SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
@@ -15,14 +15,11 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfig:
         slack_channel_id="C_RELEASE",
         slack_bot_token="xoxb-test-token",
         timezone="Europe/Moscow",
-        heartbeat_active_minutes=15,
-        heartbeat_idle_minutes=240,
         jira_project_keys=["IOS"],
         readiness_owners={"Growth": "@owner"},
-        memory_db_path=str(tmp_path / "crewai_memory.db"),
+        memory_db_path=str(tmp_path / "workflow_state.jsonl"),
         audit_log_path=str(tmp_path / "workflow_audit.jsonl"),
         slack_events_path=str(tmp_path / "slack_events.jsonl"),
-        agent_pid_path=str(tmp_path / "agent.pid"),
     )
 
 
@@ -32,10 +29,10 @@ def _append_event(path: Path, payload: dict) -> None:
 
 
 class _PauseResumeRuntime:
-    def kickoff(self, *, state: WorkflowState, events, config, now=None, trigger_reason="heartbeat_timer"):  # noqa: ANN001
+    def kickoff(self, *, state: WorkflowState, events, config, now=None, trigger_reason="event_trigger"):  # noqa: ANN001
         _ = (config, now, trigger_reason)
         if state.step == ReleaseStep.IDLE:
-            return CrewDecision(
+            return RuntimeDecision(
                 next_step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
                 next_state=WorkflowState(
                     active_release=ReleaseContext(
@@ -52,7 +49,7 @@ class _PauseResumeRuntime:
             )
         has_approval = any(event.event_type == "approval_confirmed" for event in events)
         if state.is_paused and not has_approval:
-            return CrewDecision(
+            return RuntimeDecision(
                 next_step=state.step,
                 next_state=state,
                 audit_reason="flow_paused_waiting_confirmation",
@@ -67,20 +64,20 @@ class _PauseResumeRuntime:
             )
             resumed.flow_paused_at = None
             resumed.pause_reason = None
-            return CrewDecision(
+            return RuntimeDecision(
                 next_step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
                 next_state=resumed,
                 audit_reason="flow_resumed_from_manual_confirmation",
                 flow_lifecycle="running",
             )
-        return CrewDecision(next_step=state.step, next_state=state, audit_reason="no_change")
+        return RuntimeDecision(next_step=state.step, next_state=state, audit_reason="no_change")
 
     def resume_from_pending(self, *, flow_id: str, feedback: str, state: WorkflowState):  # noqa: ANN001
         _ = (flow_id, feedback)
         resumed = WorkflowState.from_dict(state.to_dict())
         resumed.flow_paused_at = None
         resumed.pause_reason = None
-        return CrewDecision(
+        return RuntimeDecision(
             next_step=resumed.step,
             next_state=resumed,
             audit_reason="resume_dispatched",
@@ -122,15 +119,15 @@ def _build_workflow(tmp_path: Path) -> ReleaseWorkflow:
         config=cfg,
         memory=memory,
         slack_gateway=gateway,
-        crew_runtime=runtime,
+        legacy_runtime=runtime,
     )
 
 
 def test_paused_flow_does_not_advance_without_events(tmp_path: Path) -> None:
     workflow = _build_workflow(tmp_path)
 
-    first = workflow.tick(trigger_reason="heartbeat_timer")
-    second = workflow.tick(trigger_reason="heartbeat_timer")
+    first = workflow.tick(trigger_reason="manual_tick")
+    second = workflow.tick(trigger_reason="manual_tick")
 
     assert first.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert first.is_paused is True
@@ -144,7 +141,7 @@ def test_approval_event_resumes_paused_flow_once(tmp_path: Path) -> None:
     cfg = _runtime_config(tmp_path)
     events_path = Path(cfg.slack_events_path)
 
-    paused = workflow.tick(trigger_reason="heartbeat_timer")
+    paused = workflow.tick(trigger_reason="manual_tick")
     assert paused.is_paused is True
 
     _append_event(
@@ -158,10 +155,8 @@ def test_approval_event_resumes_paused_flow_once(tmp_path: Path) -> None:
             "thread_ts": "177.10",
         },
     )
-    resumed = workflow.tick(trigger_reason="signal_trigger")
+    resumed = workflow.tick(trigger_reason="webhook_event")
 
     assert resumed.step == ReleaseStep.WAIT_MEETING_CONFIRMATION
     assert resumed.is_paused is False
     assert resumed.flow_execution_id == "flow-1"
-
-

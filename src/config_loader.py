@@ -26,7 +26,6 @@ def resolve_env_value(raw_value: str, *, fallback_env_var: str) -> str:
 
 def load_runtime_config(config: dict) -> RuntimeConfig:
     workflow = config.get("workflow", {})
-    heartbeat = workflow.get("heartbeat", {})
     storage = workflow.get("storage", {})
     slack = config.get("slack", {})
     jira = config.get("jira", {})
@@ -53,12 +52,9 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         slack_channel_id=channel_id,
         slack_bot_token=bot_token,
         timezone=workflow.get("timezone", "Europe/Moscow"),
-        heartbeat_active_minutes=int(heartbeat.get("active_minutes", 15)),
-        heartbeat_idle_minutes=int(heartbeat.get("idle_minutes", 240)),
         jira_project_keys=[str(v) for v in jira.get("project_keys", [])],
         readiness_owners=readiness_owners,
-        memory_db_path=storage.get("memory_db_path", "artifacts/crewai_memory.db"),
+        memory_db_path=storage.get("memory_db_path", "artifacts/workflow_state.jsonl"),
         audit_log_path=storage.get("audit_log_path", "artifacts/workflow_audit.jsonl"),
         slack_events_path=storage.get("slack_events_path", "artifacts/slack_events.jsonl"),
-        agent_pid_path=storage.get("agent_pid_path", "artifacts/agent.pid"),
     )

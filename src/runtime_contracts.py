@@ -18,7 +18,6 @@ class AgentDecisionPayload(BaseModel):
     state_patch: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[ToolCallPayload] = Field(default_factory=list)
     audit_reason: str = "agent_decision"
-    invoke_release_manager: bool = False
     flow_lifecycle: str = "running"
 
     def to_payload(self) -> dict[str, Any]:

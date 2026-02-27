@@ -1,10 +1,7 @@
 workflow:
   timezone: "Europe/Moscow"
-  heartbeat:
-    active_minutes: 15
-    idle_minutes: 240
   storage:
-    memory_db_path: "artifacts/crewai_memory.db"
+    memory_db_path: "artifacts/workflow_state.jsonl"
     audit_log_path: "artifacts/workflow_audit.jsonl"
     slack_events_path: "artifacts/slack_events.jsonl"
   readiness_owners:

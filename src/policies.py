@@ -1,4 +1,4 @@
-"""Operational policies for the Release Manager crew."""
+"""Operational policies for the release workflow runtime."""
 from __future__ import annotations
 
 from dataclasses import dataclass

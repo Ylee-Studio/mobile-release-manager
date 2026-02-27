@@ -25,14 +25,11 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfig:
         slack_channel_id="C_RELEASE",
         slack_bot_token="xoxb-test-token",
         timezone="Europe/Moscow",
-        heartbeat_active_minutes=15,
-        heartbeat_idle_minutes=240,
         jira_project_keys=["IOS"],
         readiness_owners=READINESS_OWNERS,
-        memory_db_path=str(tmp_path / "crewai_memory.db"),
+        memory_db_path=str(tmp_path / "workflow_state.jsonl"),
         audit_log_path=str(tmp_path / "workflow_audit.jsonl"),
         slack_events_path=str(tmp_path / "slack_events.jsonl"),
-        agent_pid_path=str(tmp_path / "agent.pid"),
     )
 
 
@@ -63,7 +60,7 @@ class _InMemoryNativeMemory:
 
 class _FailIfCalledCrewRuntime:
     def kickoff(self, **kwargs):  # noqa: ANN003
-        raise AssertionError(f"crew runtime must not be called in readiness gate: {kwargs}")
+        raise AssertionError(f"runtime engine must not be called in readiness gate: {kwargs}")
 
     def resume_from_pending(self, **kwargs):  # noqa: ANN003
         raise AssertionError(f"resume_from_pending must not be called in readiness gate: {kwargs}")
@@ -115,7 +112,7 @@ def _build_workflow(tmp_path: Path) -> tuple[ReleaseWorkflow, Path]:
         config=cfg,
         memory=memory,
         slack_gateway=gateway,
-        crew_runtime=_FailIfCalledCrewRuntime(),
+        legacy_runtime=_FailIfCalledCrewRuntime(),
     )
     return workflow, Path(cfg.slack_events_path)
 
