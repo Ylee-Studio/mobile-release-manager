@@ -13,12 +13,17 @@ from typing import Any
 from crewai import Crew, Memory, Process
 
 from .agents import build_orchestrator_agent, build_release_manager_agent
-from .observability import CrewRuntimeCallbacks
 from .policies import PolicyConfig
 from .runtime_contracts import AgentDecisionPayload
 from .tasks import build_orchestrator_task, build_release_manager_task
 from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
-from .tools.slack_tools import SlackApproveTool, SlackEvent, SlackGateway, SlackMessageTool, SlackUpdateTool
+from .tools.slack_tools import (
+    SlackApproveInput,
+    SlackEvent,
+    SlackGateway,
+    SlackMessageInput,
+    SlackUpdateInput,
+)
 from .workflow_state import ReleaseFlowState, ReleaseStep, WorkflowState
 
 from crewai.flow.flow import Flow, listen, router, start
@@ -267,14 +272,12 @@ class CrewRuntimeCoordinator:
         self.policy = policy
         self.memory_db_path = memory_db_path
         self._ensure_crewai_storage_dir()
-        self.slack_tools = [
-            SlackMessageTool(gateway=slack_gateway),
-            SlackApproveTool(gateway=slack_gateway),
-            SlackUpdateTool(gateway=slack_gateway),
-        ]
         self.logger = logging.getLogger("crew_runtime")
-        self.callbacks = CrewRuntimeCallbacks()
-        self.tool_args_schema = {tool.name: tool.args_schema for tool in self.slack_tools}
+        self.tool_args_schema = {
+            "slack_message": SlackMessageInput,
+            "slack_approve": SlackApproveInput,
+            "slack_update": SlackUpdateInput,
+        }
         self._orchestrator_agent = build_orchestrator_agent(policies=self.policy)
         self._release_manager_agents: dict[str, Any] = {}
         self._orchestrator_crew: Any | None = None
@@ -581,15 +584,15 @@ class CrewRuntimeCoordinator:
         return release_manager_agent
 
     def _build_orchestrator_crew(self) -> Any:
-        task = build_orchestrator_task(agent=self._orchestrator_agent, slack_tools=self.slack_tools)
+        task = build_orchestrator_task(agent=self._orchestrator_agent)
         return Crew(
             agents=[self._orchestrator_agent],
             tasks=[task],
             process=Process.sequential,
             verbose=self.policy.agent_verbose,
             tracing=False,
-            step_callback=self.callbacks.on_step,
-            task_callback=self.callbacks.on_task,
+            step_callback=self._on_crew_step,
+            task_callback=self._on_crew_task,
             **self._crew_memory_kwargs(memory_obj=self._orchestrator_memory),
         )
 
@@ -599,16 +602,36 @@ class CrewRuntimeCoordinator:
         if memory_obj is None:
             memory_obj = self._build_crewai_memory_scope(scope_name=f"release_manager_{key}")
             self._release_manager_memories[key] = memory_obj
-        task = build_release_manager_task(agent=agent, slack_tools=self.slack_tools)
+        task = build_release_manager_task(agent=agent)
         return Crew(
             agents=[agent],
             tasks=[task],
             process=Process.sequential,
             verbose=self.policy.agent_verbose,
             tracing=False,
-            step_callback=self.callbacks.on_step,
-            task_callback=self.callbacks.on_task,
+            step_callback=self._on_crew_step,
+            task_callback=self._on_crew_task,
             **self._crew_memory_kwargs(memory_obj=memory_obj),
+        )
+
+    def _on_crew_step(self, *args: Any, **kwargs: Any) -> None:
+        lifecycle = kwargs.get("flow_lifecycle") if isinstance(kwargs, dict) else None
+        self.logger.info(
+            "crew_step at=%s args=%s kwargs=%s lifecycle=%s",
+            datetime.now(timezone.utc).isoformat(),
+            len(args),
+            sorted(kwargs.keys()),
+            lifecycle,
+        )
+
+    def _on_crew_task(self, *args: Any, **kwargs: Any) -> None:
+        lifecycle = kwargs.get("flow_lifecycle") if isinstance(kwargs, dict) else None
+        self.logger.info(
+            "crew_task at=%s args=%s kwargs=%s lifecycle=%s",
+            datetime.now(timezone.utc).isoformat(),
+            len(args),
+            sorted(kwargs.keys()),
+            lifecycle,
         )
 
     def _cleanup_release_manager_agents(self, *, next_state: WorkflowState) -> None:

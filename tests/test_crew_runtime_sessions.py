@@ -23,9 +23,9 @@ def _config() -> SimpleNamespace:
 
 def _build_coordinator(monkeypatch, tmp_path) -> CrewRuntimeCoordinator:
     monkeypatch.setattr("src.crew_runtime.build_orchestrator_agent", lambda *, policies: object())
-    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent, slack_tools: {"task": "orchestrator"})
+    monkeypatch.setattr("src.crew_runtime.build_orchestrator_task", lambda *, agent: {"task": "orchestrator"})
     monkeypatch.setattr("src.crew_runtime.build_release_manager_agent", lambda *, policies, release_version: object())
-    monkeypatch.setattr("src.crew_runtime.build_release_manager_task", lambda *, agent, slack_tools: {"task": "release_manager"})
+    monkeypatch.setattr("src.crew_runtime.build_release_manager_task", lambda *, agent: {"task": "release_manager"})
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
     return CrewRuntimeCoordinator(
         policy=_policy(),

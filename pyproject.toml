@@ -9,6 +9,7 @@ dependencies = [
     "typer>=0.12.3",
     "rich>=13.7.1",
     "pyyaml>=6.0.1",
+    "slack-sdk>=3.40.1",
 ]
 
 [project.optional-dependencies]

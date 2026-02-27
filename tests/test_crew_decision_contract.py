@@ -112,16 +112,18 @@ def test_decision_accepts_manual_release_confirmation_alias_from_agent() -> None
     assert decision.next_state.active_release.step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
 
 
-def test_native_tool_call_extraction_from_function_payload() -> None:
+def test_native_tool_call_extraction_from_canonical_payload() -> None:
     result = {
         "tasks_output": [
             {
                 "tool_calls": [
                     {
-                        "function": {
-                            "name": "slack_approve",
-                            "arguments": '{"channel_id":"C0AGLKF6KHD","text":"start","approve_label":"Ok"}',
-                        }
+                        "tool": "slack_approve",
+                        "args": {
+                            "channel_id": "C0AGLKF6KHD",
+                            "text": "start",
+                            "approve_label": "Ok",
+                        },
                     }
                 ]
             }

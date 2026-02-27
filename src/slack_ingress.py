@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .config_loader import resolve_env_value
+
 
 @dataclass
 class SlackIngressConfig:
@@ -256,13 +258,10 @@ def build_ingress_config(config: dict) -> SlackIngressConfig:
     storage = workflow.get("storage", {})
     slack = config.get("slack", {})
 
-    raw_channel = str(slack.get("channel_id", ""))
-    if raw_channel.startswith("${") and raw_channel.endswith("}"):
-        channel_id = os.getenv(raw_channel[2:-1], "")
-    else:
-        channel_id = raw_channel
-    if not channel_id:
-        channel_id = os.getenv("SLACK_ANNOUNCE_CHANNEL", "")
+    channel_id = resolve_env_value(
+        str(slack.get("channel_id", "")),
+        fallback_env_var="SLACK_ANNOUNCE_CHANNEL",
+    )
     if not channel_id:
         raise RuntimeError("SLACK_ANNOUNCE_CHANNEL must be set for Slack ingress.")
 

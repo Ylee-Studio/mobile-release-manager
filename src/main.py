@@ -10,8 +10,9 @@ from pathlib import Path
 from crewai import Memory
 import typer
 from rich.console import Console
+import yaml
 
-from .config_loader import ensure_env_vars, load_config, load_runtime_config
+from .config_loader import CONFIG_PATH, REQUIRED_ENV_VARS, load_runtime_config
 from .crew_runtime import CrewRuntimeCoordinator
 from .policies import PolicyConfig
 from .release_workflow import ReleaseWorkflow
@@ -24,16 +25,15 @@ console = Console()
 MAX_SIGNAL_DRAIN_TICKS = 3
 
 
-def _configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
-
 def _build_workflow() -> tuple[ReleaseWorkflow, int, int, Path]:
-    ensure_env_vars()
-    config = load_config()
+    missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(sorted(missing)))
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Missing config.yaml at {CONFIG_PATH}")
+    with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        raw_config = yaml.safe_load(handle)
+    config = raw_config if isinstance(raw_config, dict) else {}
     runtime = load_runtime_config(config)
     policy = PolicyConfig.from_dict(config.get("policies", {}))
     slack_gateway = SlackGateway(
@@ -72,7 +72,10 @@ def _pending_events_count(workflow: ReleaseWorkflow) -> int | None:
 @app.command()
 def tick() -> None:
     """Execute one heartbeat tick."""
-    _configure_logging()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     workflow, _active, _idle, _pid_path = _build_workflow()
     state = workflow.tick()
     console.print(f"[green]Tick complete.[/] Current step: {state.step.value}")
@@ -81,7 +84,10 @@ def tick() -> None:
 @app.command("run-heartbeat")
 def run_heartbeat(iterations: int = typer.Option(0, help="0 means infinite loop.")) -> None:
     """Run the heartbeat loop."""
-    _configure_logging()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     workflow, active_minutes, idle_minutes, agent_pid_path = _build_workflow()
     pending_trigger_count = 0
     last_signal_monotonic: float | None = None
@@ -186,8 +192,15 @@ def run_slack_webhook(
     port: int = typer.Option(8080, help="Port for webhook HTTP server."),
 ) -> None:
     """Run minimal Slack webhook ingress server."""
-    _configure_logging()
-    config = load_config()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Missing config.yaml at {CONFIG_PATH}")
+    with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        raw_config = yaml.safe_load(handle)
+    config = raw_config if isinstance(raw_config, dict) else {}
     runtime = load_runtime_config(config)
     agent_pid_path = Path(runtime.agent_pid_path)
     logger = logging.getLogger("slack_ingress")

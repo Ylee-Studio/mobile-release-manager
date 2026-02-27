@@ -1,11 +1,8 @@
-"""Configuration helpers for release workflow runtime."""
+"""Runtime configuration mapping from raw config dict."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable
-
-import yaml
 
 from .release_workflow import RuntimeConfig
 
@@ -18,24 +15,7 @@ REQUIRED_ENV_VARS = [
 ]
 
 
-def load_config() -> dict:
-    """Load the YAML configuration file."""
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Missing config.yaml at {CONFIG_PATH}")
-    with CONFIG_PATH.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
-
-
-def ensure_env_vars(vars_to_check: Iterable[str] | None = None) -> None:
-    """Ensure environment variables are set before running the crew."""
-    missing = [var for var in (vars_to_check or REQUIRED_ENV_VARS) if not os.getenv(var)]
-    if missing:
-        raise RuntimeError(
-            "Missing required environment variables: " + ", ".join(sorted(missing))
-        )
-
-
-def _resolve_env_value(raw_value: str, *, fallback_env_var: str) -> str:
+def resolve_env_value(raw_value: str, *, fallback_env_var: str) -> str:
     value = raw_value
     if value.startswith("${") and value.endswith("}"):
         value = os.getenv(value[2:-1], "")
@@ -55,11 +35,11 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         str(team): str(owner)
         for team, owner in workflow.get("readiness_owners", {}).items()
     }
-    channel_id = _resolve_env_value(
+    channel_id = resolve_env_value(
         str(slack.get("channel_id", "")),
         fallback_env_var="SLACK_ANNOUNCE_CHANNEL",
     )
-    bot_token = _resolve_env_value(
+    bot_token = resolve_env_value(
         str(slack.get("bot_token", "")),
         fallback_env_var="SLACK_BOT_TOKEN",
     )

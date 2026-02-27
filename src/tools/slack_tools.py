@@ -8,11 +8,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-from crewai.tools import BaseTool
 from pydantic import BaseModel, Field, field_validator
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 
 @dataclass
@@ -37,65 +36,69 @@ class SlackGateway:
         self.timeout_seconds = timeout_seconds
         if not self.bot_token:
             raise RuntimeError("SLACK_BOT_TOKEN must be configured for SlackGateway.")
+        self.client = WebClient(token=self.bot_token, timeout=self.timeout_seconds)
 
     def send_message(self, channel_id: str, text: str, *, thread_ts: str | None = None) -> dict[str, str]:
-        payload: dict[str, Any] = {
-            "channel": channel_id,
-            "text": text,
-        }
-        if thread_ts:
-            payload["thread_ts"] = thread_ts
-        return self._request_ts(method_name="chat.postMessage", payload=payload)
+        try:
+            response = self.client.chat_postMessage(
+                channel=channel_id,
+                text=text,
+                thread_ts=thread_ts,
+            )
+        except SlackApiError as exc:
+            raise _runtime_error_from_slack("chat.postMessage", exc) from exc
+        return _message_ts_from_response(response=response, method_name="chat.postMessage")
 
     def send_approve(self, channel_id: str, text: str, approve_label: str) -> dict[str, str]:
-        payload = {
-            "channel": channel_id,
-            "text": text,
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": text},
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "action_id": "release_approve",
-                            "text": {"type": "plain_text", "text": approve_label},
-                            "style": "primary",
-                            "value": approve_label,
-                        }
-                    ],
-                },
-            ],
-        }
-        return self._request_ts(method_name="chat.postMessage", payload=payload)
+        try:
+            response = self.client.chat_postMessage(
+                channel=channel_id,
+                text=text,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": text},
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "release_approve",
+                                "text": {"type": "plain_text", "text": approve_label},
+                                "style": "primary",
+                                "value": approve_label,
+                            }
+                        ],
+                    },
+                ],
+            )
+        except SlackApiError as exc:
+            raise _runtime_error_from_slack("chat.postMessage", exc) from exc
+        return _message_ts_from_response(response=response, method_name="chat.postMessage")
 
     def update_message(self, channel_id: str, message_ts: str, text: str) -> dict[str, str]:
-        return self._request_ts(
-            method_name="chat.update",
-            payload={
-                "channel": channel_id,
-                "ts": message_ts,
-                "text": text,
-            },
-        )
+        try:
+            response = self.client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text=text,
+            )
+        except SlackApiError as exc:
+            raise _runtime_error_from_slack("chat.update", exc) from exc
+        return _message_ts_from_response(response=response, method_name="chat.update")
 
     def add_reaction(self, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:
         """Add reaction to a message; treat duplicate reaction as success."""
         try:
-            self._request_json(
-                method_name="reactions.add",
-                payload={
-                    "channel": channel_id,
-                    "timestamp": message_ts,
-                    "name": emoji,
-                },
+            self.client.reactions_add(
+                channel=channel_id,
+                timestamp=message_ts,
+                name=emoji,
             )
             return True
-        except RuntimeError as exc:
-            error_text = str(exc)
+        except SlackApiError as exc:
+            error_text = _slack_error_code(exc)
             if "already_reacted" in error_text or "missing_scope" in error_text:
                 self.logger.debug(
                     "reaction skipped channel=%s ts=%s emoji=%s reason=%s",
@@ -105,7 +108,7 @@ class SlackGateway:
                     "already_reacted" if "already_reacted" in error_text else "missing_scope",
                 )
                 return False
-            raise
+            raise _runtime_error_from_slack("reactions.add", exc) from exc
 
     def poll_events(self) -> list[SlackEvent]:
         if not self.events_path.exists():
@@ -168,45 +171,31 @@ class SlackGateway:
             self.logger.warning("dropped malformed slack event line: %s", consumed_line[:200])
             return None
 
-    def _request_ts(self, *, method_name: str, payload: dict[str, Any]) -> dict[str, str]:
-        response = self._request_json(method_name=method_name, payload=payload)
-        message_ts = response.get("ts")
-        if not message_ts:
-            raise RuntimeError(f"Slack API {method_name} did not return message ts.")
-        return {"message_ts": str(message_ts)}
 
-    def _request_json(self, *, method_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        endpoint = f"https://slack.com/api/{method_name}"
-        raw_payload = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        request = Request(
-            url=endpoint,
-            data=raw_payload,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self.bot_token}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-        )
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                raw_body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Slack API {method_name} failed with HTTP {exc.code}: {body}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Slack API {method_name} failed: {exc.reason}") from exc
+def _slack_error_code(exc: SlackApiError) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+    code = response.get("error")
+    return str(code or str(exc))
 
-        try:
-            parsed = json.loads(raw_body) if raw_body.strip() else {}
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Slack API {method_name} returned invalid JSON: {raw_body}") from exc
 
-        if not isinstance(parsed, dict):
-            raise RuntimeError(f"Slack API {method_name} returned unexpected payload type.")
-        if not parsed.get("ok", False):
-            error_text = parsed.get("error", "unknown_error")
-            raise RuntimeError(f"Slack API {method_name} failed: {error_text}")
-        return parsed
+def _runtime_error_from_slack(method_name: str, exc: SlackApiError) -> RuntimeError:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return RuntimeError(f"Slack API {method_name} failed: {exc}")
+    status_code = getattr(response, "status_code", None)
+    error_code = response.get("error")
+    if status_code:
+        return RuntimeError(f"Slack API {method_name} failed with HTTP {status_code}: {error_code}")
+    return RuntimeError(f"Slack API {method_name} failed: {error_code}")
+
+
+def _message_ts_from_response(*, response: Any, method_name: str) -> dict[str, str]:
+    message_ts = response.get("ts")
+    if not message_ts:
+        raise RuntimeError(f"Slack API {method_name} did not return message ts.")
+    return {"message_ts": str(message_ts)}
 
 
 class SlackMessageInput(BaseModel):
@@ -231,17 +220,6 @@ class SlackMessageInput(BaseModel):
         return stripped or None
 
 
-class SlackMessageTool(BaseTool):
-    name: str = "slack_message"
-    description: str = "Send a message to Slack channel or thread."
-    args_schema: type[BaseModel] = SlackMessageInput
-
-    gateway: SlackGateway
-
-    def _run(self, channel_id: str, text: str, thread_ts: str | None = None) -> dict[str, str]:
-        return self.gateway.send_message(channel_id=channel_id, text=text, thread_ts=thread_ts)
-
-
 class SlackApproveInput(BaseModel):
     channel_id: str = Field(..., min_length=1, description="Target Slack channel id.")
     text: str = Field(..., min_length=1, description="Approval request text.")
@@ -254,17 +232,6 @@ class SlackApproveInput(BaseModel):
         if not stripped:
             raise ValueError("must be non-empty")
         return stripped
-
-
-class SlackApproveTool(BaseTool):
-    name: str = "slack_approve"
-    description: str = "Send an approval message to Slack."
-    args_schema: type[BaseModel] = SlackApproveInput
-
-    gateway: SlackGateway
-
-    def _run(self, channel_id: str, text: str, approve_label: str = "Подтвердить") -> dict[str, str]:
-        return self.gateway.send_approve(channel_id=channel_id, text=text, approve_label=approve_label)
 
 
 class SlackUpdateInput(BaseModel):
@@ -281,12 +248,3 @@ class SlackUpdateInput(BaseModel):
         return stripped
 
 
-class SlackUpdateTool(BaseTool):
-    name: str = "slack_update"
-    description: str = "Update an existing Slack message."
-    args_schema: type[BaseModel] = SlackUpdateInput
-
-    gateway: SlackGateway
-
-    def _run(self, channel_id: str, message_ts: str, text: str) -> dict[str, str]:
-        return self.gateway.update_message(channel_id=channel_id, message_ts=message_ts, text=text)

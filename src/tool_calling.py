@@ -1,7 +1,6 @@
 """Helpers for schema-first tool call extraction and validation."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,7 +41,7 @@ def canonical_tool_name(name: Any) -> str:
 
 
 def extract_native_tool_calls(result: Any) -> list[dict[str, Any]]:
-    """Best-effort extraction of structured native tool calls from Crew result."""
+    """Extract canonical tool calls ({tool, reason, args}) from Crew result."""
 
     entries: list[Any] = []
     direct_fields = ("tool_calls", "tools_called", "tool_invocations")
@@ -139,71 +138,19 @@ def _extract_attr_or_key(container: Any, key: str) -> Any:
 
 
 def _coerce_tool_call(raw_call: Any) -> dict[str, Any] | None:
-    if isinstance(raw_call, dict):
-        if isinstance(raw_call.get("tool"), (str, int, float)):
-            return {
-                "tool": raw_call.get("tool"),
-                "reason": raw_call.get("reason", ""),
-                "args": raw_call.get("args", {}),
-            }
-        function_payload = raw_call.get("function")
-        if isinstance(function_payload, dict):
-            name = function_payload.get("name")
-            arguments = function_payload.get("arguments")
-            return {
-                "tool": name,
-                "reason": raw_call.get("reason", ""),
-                "args": _parse_arguments(arguments),
-            }
-        name = raw_call.get("name") or raw_call.get("tool_name")
-        if name:
-            arguments = raw_call.get("arguments", raw_call.get("tool_input", raw_call.get("input", {})))
-            return {
-                "tool": name,
-                "reason": raw_call.get("reason", ""),
-                "args": _parse_arguments(arguments),
-            }
+    if not isinstance(raw_call, dict):
         return None
-
-    function_payload = getattr(raw_call, "function", None)
-    if function_payload is not None:
-        name = _extract_attr_or_key(function_payload, "name")
-        arguments = _extract_attr_or_key(function_payload, "arguments")
-        return {
-            "tool": name,
-            "reason": str(getattr(raw_call, "reason", "") or ""),
-            "args": _parse_arguments(arguments),
-        }
-
-    name = getattr(raw_call, "name", None) or getattr(raw_call, "tool_name", None)
-    if name:
-        arguments = (
-            getattr(raw_call, "arguments", None)
-            or getattr(raw_call, "tool_input", None)
-            or getattr(raw_call, "input", None)
-        )
-        return {
-            "tool": name,
-            "reason": str(getattr(raw_call, "reason", "") or ""),
-            "args": _parse_arguments(arguments),
-        }
-    return None
-
-
-def _parse_arguments(arguments: Any) -> dict[str, Any]:
-    if isinstance(arguments, dict):
-        return arguments
-    if isinstance(arguments, str):
-        raw = arguments.strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        if isinstance(parsed, dict):
-            return parsed
-        return {}
+    tool = raw_call.get("tool")
+    args = raw_call.get("args")
+    if not isinstance(tool, (str, int, float)):
+        return None
+    if not isinstance(args, dict):
+        return None
+    return {
+        "tool": tool,
+        "reason": raw_call.get("reason", ""),
+        "args": args,
+    }
     return {}
 
 

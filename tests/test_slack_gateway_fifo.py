@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from slack_sdk.errors import SlackApiError
+
 from src.tools.slack_tools import SlackGateway
 
 
@@ -101,26 +103,23 @@ def test_add_reaction_calls_reactions_add(tmp_path: Path, monkeypatch) -> None:
         bot_token="xoxb-test-token",
         events_path=tmp_path / "slack_events.jsonl",
     )
-    captured: list[tuple[str, dict[str, str]]] = []
+    captured: list[dict[str, str]] = []
 
-    def _fake_request_json(*, method_name: str, payload: dict[str, str]) -> dict[str, bool]:
-        captured.append((method_name, payload))
+    def _fake_reactions_add(**kwargs):  # noqa: ANN003
+        captured.append(kwargs)
         return {"ok": True}
 
-    monkeypatch.setattr(gateway, "_request_json", _fake_request_json)
+    monkeypatch.setattr(gateway.client, "reactions_add", _fake_reactions_add)
 
     added = gateway.add_reaction("C_RELEASE", "1700000000.123456", "eyes")
 
     assert added is True
     assert captured == [
-        (
-            "reactions.add",
-            {
-                "channel": "C_RELEASE",
-                "timestamp": "1700000000.123456",
-                "name": "eyes",
-            },
-        )
+        {
+            "channel": "C_RELEASE",
+            "timestamp": "1700000000.123456",
+            "name": "eyes",
+        }
     ]
 
 
@@ -130,10 +129,11 @@ def test_add_reaction_treats_already_reacted_as_success(tmp_path: Path, monkeypa
         events_path=tmp_path / "slack_events.jsonl",
     )
 
-    def _fake_request_json(*, method_name: str, payload: dict[str, str]) -> dict[str, bool]:  # noqa: ARG001
-        raise RuntimeError("Slack API reactions.add failed: already_reacted")
+    def _fake_reactions_add(**kwargs):  # noqa: ANN003, ARG001
+        response = {"ok": False, "error": "already_reacted"}
+        raise SlackApiError(message="already_reacted", response=response)
 
-    monkeypatch.setattr(gateway, "_request_json", _fake_request_json)
+    monkeypatch.setattr(gateway.client, "reactions_add", _fake_reactions_add)
 
     added = gateway.add_reaction("C_RELEASE", "1700000000.123456", "eyes")
 
@@ -146,10 +146,11 @@ def test_add_reaction_treats_missing_scope_as_non_fatal(tmp_path: Path, monkeypa
         events_path=tmp_path / "slack_events.jsonl",
     )
 
-    def _fake_request_json(*, method_name: str, payload: dict[str, str]) -> dict[str, bool]:  # noqa: ARG001
-        raise RuntimeError("Slack API reactions.add failed: missing_scope")
+    def _fake_reactions_add(**kwargs):  # noqa: ANN003, ARG001
+        response = {"ok": False, "error": "missing_scope"}
+        raise SlackApiError(message="missing_scope", response=response)
 
-    monkeypatch.setattr(gateway, "_request_json", _fake_request_json)
+    monkeypatch.setattr(gateway.client, "reactions_add", _fake_reactions_add)
 
     added = gateway.add_reaction("C_RELEASE", "1700000000.123456", "eyes")
 

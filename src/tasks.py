@@ -29,7 +29,7 @@ _COMMON_FORMAT_RULES = (
 )
 
 
-def build_orchestrator_task(agent, slack_tools):
+def build_orchestrator_task(agent):
     """Return orchestrator task that controls workflow routing."""
     return Task(
         description=(
@@ -80,12 +80,11 @@ def build_orchestrator_task(agent, slack_tools):
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason, invoke_release_manager, flow_lifecycle."
         ),
         output_pydantic=AgentDecisionPayload,
-        tools=[*slack_tools],
         agent=agent,
     )
 
 
-def build_release_manager_task(agent, slack_tools):
+def build_release_manager_task(agent):
     """Return release-manager task that executes release side effects."""
     return Task(
         description=(
@@ -157,6 +156,5 @@ def build_release_manager_task(agent, slack_tools):
             "Valid JSON object with next_step, next_state, tool_calls, audit_reason, flow_lifecycle."
         ),
         output_pydantic=AgentDecisionPayload,
-        tools=[*slack_tools],
         agent=agent,
     )
