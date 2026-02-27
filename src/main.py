@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import logging
 import os
-from queue import Empty, Queue
-from threading import Event, Thread
+from queue import Queue
+from threading import Thread
 from pathlib import Path
 
+from dotenv import load_dotenv
 import typer
+
+# Load environment variables from .env file
+load_dotenv()
 from rich.console import Console
 import yaml
 
@@ -77,18 +81,18 @@ def run_slack_webhook(
     )
     workflow = _build_workflow()
     logger = logging.getLogger("slack_ingress")
-    event_queue: Queue[None] = Queue()
-    stop_worker = Event()
+    event_queue: Queue[object] = Queue()
+    worker_stop_sentinel = object()
 
     def _process_event_worker() -> None:
-        while not stop_worker.is_set():
+        while True:
+            queue_item = event_queue.get()
             try:
-                event_queue.get(timeout=0.2)
-            except Empty:
-                continue
-            try:
+                if queue_item is worker_stop_sentinel:
+                    return
+                logger.info("start processing webhook event")
                 state = workflow.tick(trigger_reason="webhook_event")
-                logger.info("processed webhook event step=%s", state.step.value)
+                logger.info("finished processing webhook event step=%s", state.step.value)
             except Exception as exc:  # pragma: no cover - runtime safety
                 logger.exception("webhook-triggered tick failed: %s", exc)
             finally:
@@ -116,8 +120,8 @@ def run_slack_webhook(
             on_event_persisted=_enqueue_event_for_processing,
         )
     finally:
+        event_queue.put_nowait(worker_stop_sentinel)
         event_queue.join()
-        stop_worker.set()
         worker.join(timeout=1)
 
 

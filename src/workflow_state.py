@@ -21,7 +21,8 @@ class ReleaseStep(str, Enum):
     READY_FOR_BRANCH_CUT = "READY_FOR_BRANCH_CUT"
 
 
-_STATUS_TO_STEP: dict[str, ReleaseStep] = {
+# Shared aliases for external status values (LLM payloads/manual overrides).
+STATUS_ALIASES_TO_STEP: dict[str, ReleaseStep] = {
     "AWAITING_START_APPROVAL": ReleaseStep.WAIT_START_APPROVAL,
     "WAITING_START_APPROVAL": ReleaseStep.WAIT_START_APPROVAL,
     "RELEASE_MANAGER_ACTIVE": ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
@@ -34,7 +35,7 @@ _STATUS_TO_STEP: dict[str, ReleaseStep] = {
 }
 
 
-def _coerce_step(value: Any, *, fallback: ReleaseStep) -> ReleaseStep:
+def coerce_release_step(value: Any, *, fallback: ReleaseStep) -> ReleaseStep:
     if isinstance(value, ReleaseStep):
         return value
     if isinstance(value, str):
@@ -43,8 +44,8 @@ def _coerce_step(value: Any, *, fallback: ReleaseStep) -> ReleaseStep:
             return fallback
         if normalized in ReleaseStep._value2member_map_:
             return ReleaseStep(normalized)
-        if normalized in _STATUS_TO_STEP:
-            return _STATUS_TO_STEP[normalized]
+        if normalized in STATUS_ALIASES_TO_STEP:
+            return STATUS_ALIASES_TO_STEP[normalized]
     return fallback
 
 
@@ -110,7 +111,7 @@ class WorkflowState(BaseModel):
                 or ""
             ).strip()
             if release_version:
-                step = _coerce_step(
+                step = coerce_release_step(
                     active_raw.get("step") or active_raw.get("status"),
                     fallback=ReleaseStep.IDLE,
                 )
@@ -142,13 +143,3 @@ class WorkflowState(BaseModel):
             pause_reason=raw.get("pause_reason"),
             checkpoints=list(raw.get("checkpoints", [])),
         )
-
-
-class ReleaseFlowState(BaseModel):
-    """CrewAI Flow state wrapper for release workflow execution."""
-
-    state: dict[str, Any] = Field(default_factory=dict)
-    events: list[dict[str, Any]] = Field(default_factory=list)
-    config: dict[str, Any] = Field(default_factory=dict)
-    trigger_reason: str = "event_trigger"
-    now_iso: str = ""

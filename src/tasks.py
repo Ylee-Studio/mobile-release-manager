@@ -1,93 +1,190 @@
-"""Single-agent task definition for direct runtime."""
+"""Task definition and detailed behavior instructions for Pydantic AI agent."""
 from __future__ import annotations
 
 from .runtime_contracts import AgentDecisionPayload
 
+# Schema definitions for LLM context
 _RELEASE_STEP_VALUES = (
-    "IDLE|WAIT_START_APPROVAL|"
-    "WAIT_MANUAL_RELEASE_CONFIRMATION|WAIT_MEETING_CONFIRMATION|"
-    "WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT"
+    "IDLE|WAIT_START_APPROVAL|WAIT_MANUAL_RELEASE_CONFIRMATION|"
+    "WAIT_MEETING_CONFIRMATION|WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT"
 )
-_TOOL_NAMES = "slack_message, slack_approve, slack_update"
-_TOOL_EXAMPLES = (
-    "{tool:'slack_message',args:{channel_id:'C123',text:'ok',thread_ts:'177.1'}}; "
-    "{tool:'slack_approve',args:{channel_id:'C123',text:'approve?',approve_label:'Подтвердить'}}; "
-    "{tool:'slack_update',args:{channel_id:'C123',message_ts:'177.1',text:'done'}}."
-)
-_COMMON_SCHEMA_DEFS = (
-    f"Schema definitions:\n"
-    f"- ReleaseStep := {_RELEASE_STEP_VALUES}\n"
-    '- FlowLifecycle := "running" | "paused" | "completed"\n'
-    '- ToolCall := {"tool":"name","reason":"why","args":{...}}\n'
-)
-_COMMON_FORMAT_RULES = (
-    f"Use only canonical tool names: {_TOOL_NAMES} "
-    "(never use functions.* aliases). "
-    f"Tool args must match args_schema exactly. Valid examples: {_TOOL_EXAMPLES}"
-)
+
+_TOOL_SCHEMA_DEFS = """
+Available tools:
+1. slack_message - Send message to Slack channel
+   Args: {channel_id: string, text: string, thread_ts?: string}
+
+2. slack_approve - Send approval request with button
+   Args: {channel_id: string, text: string, approve_label: string}
+
+3. slack_update - Update existing Slack message
+   Args: {channel_id: string, message_ts: string, text: string}
+
+Tool call format:
+{"tool": "slack_message", "reason": "why this call is made", "args": {...}}
+"""
+
+_RESPONSE_SCHEMA_DEFS = f"""
+Response schema (AgentDecision):
+- next_step: ReleaseStep enum value, one of: {_RELEASE_STEP_VALUES}
+- next_state: dict with active_release, flow_execution_id, checkpoints, etc.
+- state_patch: optional partial updates to merge into next_state
+- tool_calls: list of tool call objects
+- audit_reason: string explaining the decision
+- flow_lifecycle: "running" | "paused" | "completed"
+"""
 
 
 def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
-    """Return single flow-agent prompt payload."""
+    """Return detailed task instructions for Pydantic AI agent.
+
+    This defines the step-by-step behavior logic that the agent must follow.
+    The system-level role and constraints come from build_flow_agent().
+    """
     return {
         "agent": agent,
         "schema": AgentDecisionPayload,
         "description": (
-            "You receive `state`, `events`, `config`, `now_iso`, `trigger_reason` as inputs. "
-            "Execute the whole release flow from WAIT_START_APPROVAL to READY_FOR_BRANCH_CUT "
-            "using one agent and return the updated workflow state."
-            "\n"
-            "Input context (authoritative):\n"
-            "state={state}\n"
-            "events={events}\n"
-            "config={config}\n"
-            "now_iso={now_iso}\n"
-            "trigger_reason={trigger_reason}\n"
-            "\n"
-            "Behavior requirements:\n"
-            "- Return flow_lifecycle='paused' while waiting for human confirmation, "
-            "flow_lifecycle='running' after approval_confirmed transitions, and "
-            "flow_lifecycle='completed' only when flow is truly finished.\n"
-            "- Ensure all confirmation gates are compatible with pending-flow recovery via flow_execution_id.\n"
-            "- Move from WAIT_START_APPROVAL directly to WAIT_MANUAL_RELEASE_CONFIRMATION and "
-            "request release creation confirmation via exactly one slack_approve tool call.\n"
-            "- WAIT_MANUAL_RELEASE_CONFIRMATION text must explicitly contain "
-            "'Подтвердите создание релиза X.Y.Z в JIRA' (with actual version).\n"
-            "- After any approval_confirmed event, include slack_update for the trigger "
-            "message so buttons disappear and text ends with :white_check_mark:.\n"
-            "- After manual release confirmation event, move directly to "
-            "WAIT_MEETING_CONFIRMATION and include exactly one slack_approve tool call "
-            "that asks to confirm the release-fixation meeting has already happened "
-            "(\"подтвердите, что встреча фиксации релиза уже прошла\").\n"
-            "- Never use wording about meeting scheduling/appointment "
-            "(\"назначение встречи\") for WAIT_MEETING_CONFIRMATION.\n"
-            "- When transitioning to WAIT_READINESS_CONFIRMATIONS, include exactly one "
-            "slack_message tool call with non-empty args.channel_id and args.text. "
-            "args.text must include: "
-            "'Релиз <https://instories.atlassian.net/issues/?jql=JQL|X.Y.Z>', blank line, "
-            "'Статус готовности к срезу:', one ':hourglass_flowing_sand: <Team> <Owner mention>' "
-            "line per team from config.readiness_owners, blank line, "
-            "'Напишите в треде по готовности своей части.', and "
-            "'**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
-            "едут в релиз только после одобрения QA'.\n"
-            "- If next_step is WAIT_READINESS_CONFIRMATIONS and required readiness message "
-            "is missing, keep current step unchanged and return audit_reason explaining why.\n"
-            "- In WAIT_READINESS_CONFIRMATIONS, do not transition to READY_FOR_BRANCH_CUT "
-            "until all teams from config.readiness_owners are confirmed in "
-            "next_state.active_release.readiness_map with value true.\n"
-            "\n"
-            f"{_COMMON_SCHEMA_DEFS}"
-            "Required output JSON schema:\n"
-            "{\n"
-            '  "next_step": "<ReleaseStep>",\n'
-            '  "next_state": { ... WorkflowState dict ... },\n'
-            '  "tool_calls": [<ToolCall>],\n'
-            '  "audit_reason": "short explanation",\n'
-            '  "flow_lifecycle": "running|paused|completed"\n'
-            "}\n"
-            "Use `next_state` as the complete state snapshot for persistence. "
-            f"{_COMMON_FORMAT_RULES} "
-            "Include all required tool fields. "
-            "If no change is needed, return the same state with matching next_step and consistent flow_lifecycle."
+            "# Release Workflow Orchestrator Task\n\n"
+            "You receive the following inputs:\n"
+            "- state: Current WorkflowState dict\n"
+            "- events: List of Slack events since last tick\n"
+            "- config: {slack_channel_id, timezone, jira_project_keys, readiness_owners}\n"
+            "- now_iso: Current timestamp ISO format\n"
+            "- trigger_reason: Why this tick was triggered\n\n"
+            "Runtime contract:\n"
+            "- Runtime is agent-first and does not apply deterministic business transitions.\n"
+            "- If runtime cannot parse/validate your output, it falls back to safe no-op.\n\n"
+            f"{_RESPONSE_SCHEMA_DEFS}\n\n"
+            f"{_TOOL_SCHEMA_DEFS}\n\n"
+            "## Workflow State Transitions\n\n"
+            "### 0. Manual status override command (highest priority)\n"
+            "Trigger: events contain message 'Переведи X.Y.Z в STATUS' (case-insensitive)\n"
+            "Message preprocessing:\n"
+            "- If message starts with Slack mention(s) like '<@U...>', ignore mention prefix and parse remaining text\n"
+            "Allowed STATUS values:\n"
+            "- Any ReleaseStep value: IDLE, WAIT_START_APPROVAL, WAIT_MANUAL_RELEASE_CONFIRMATION, "
+            "WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, READY_FOR_BRANCH_CUT\n"
+            "- Aliases: AWAITING_START_APPROVAL, WAITING_START_APPROVAL, RELEASE_MANAGER_ACTIVE, "
+            "RELEASE_MANAGER_CREATED, AWAITING_MANUAL_RELEASE_CONFIRMATION, JIRA_RELEASE_READY, "
+            "JIRA_RELEASE_CREATED, AWAITING_MEETING_CONFIRMATION, AWAITING_READINESS_CONFIRMATIONS\n"
+            "Actions:\n"
+            "- Parse release version from message text (must match X.Y.Z)\n"
+            "- Parse STATUS and convert to next_step\n"
+            "- Do not generate tool_calls for this command\n"
+            "- This command is valid even when flow is paused if current tick contains message events\n"
+            "- If STATUS resolves to IDLE: clear active_release, clear pause metadata, set flow_lifecycle='completed'\n"
+            "- Otherwise: set/create active_release for that version with parsed next_step, set flow_lifecycle='paused'\n"
+            "- Set audit_reason to 'manual_status_override:{release_version}->{next_step}'\n\n"
+            "### 1. IDLE → WAIT_START_APPROVAL\n"
+            "Trigger: events contain 'manual_start' event with version string (e.g., '5.105.0')\n"
+            "Actions:\n"
+            "- Parse version from event.text (must match X.Y.Z format)\n"
+            "- Create active_release: {release_version, step: WAIT_START_APPROVAL, slack_channel_id}\n"
+            "- Set flow_execution_id to new UUID if not present\n"
+            "- Add exactly ONE slack_approve tool call for start approval:\n"
+            '  Args: {channel_id, text: "Подтвердите старт релизного трейна {version}. Если нужен другой номер для релиза, напишите в треде.", approve_label: "Подтвердить"}\n'
+            "- Set flow_lifecycle='paused' (waiting for start approval)\n"
+            "- Do NOT send slack_message instead of slack_approve for this step\n\n"
+            "### 2. WAIT_START_APPROVAL → WAIT_MANUAL_RELEASE_CONFIRMATION\n"
+            "Trigger: approval_confirmed received while current step is WAIT_START_APPROVAL\n"
+            "Actions:\n"
+            "- Set next_step = WAIT_MANUAL_RELEASE_CONFIRMATION\n"
+            "- Add slack_update for approved start-approval message.\n"
+            '  Args: {channel_id, message_ts, text: "Подтверждено :white_check_mark:"} (runtime appends confirmation to original message text from event metadata)\n'
+            "- Add exactly ONE slack_approve tool call for Jira release creation:\n"
+            '  Args: {channel_id, text: "Подтвердите создание релиза {version} в JIRA", approve_label: "Подтвердить"}\n'
+            "- Save message_ts from this approval message to active_release.message_ts['manual_release_confirmation']\n"
+            "- Return flow_lifecycle='paused' (waiting for human)\n\n"
+            "### 3. On approval_confirmed event (button clicked)\n"
+            "Trigger: events contain 'approval_confirmed' event\n"
+            "Actions:\n"
+            "- Find matching approval message via message_ts\n"
+            "- Add slack_update tool call to mark approval as confirmed:\n"
+            '  Args: {channel_id, message_ts, text: "Подтверждено :white_check_mark:"} (runtime appends confirmation to original message text from event metadata)\n'
+            "- Transition based on current step\n\n"
+            "### 4. WAIT_MANUAL_RELEASE_CONFIRMATION → WAIT_MEETING_CONFIRMATION\n"
+            "Trigger: approval_confirmed received in WAIT_MANUAL_RELEASE_CONFIRMATION\n"
+            "Actions:\n"
+            "- Set next_step = WAIT_MEETING_CONFIRMATION\n"
+            "- Add slack_approve tool call:\n"
+            '  Args: {channel_id, text: "Подтвердите, что встреча фиксации релиза уже прошла", approve_label: "Встреча прошла"}\n'
+            "- Return flow_lifecycle='paused'\n\n"
+            "### 5. WAIT_MEETING_CONFIRMATION → WAIT_READINESS_CONFIRMATIONS\n"
+            "Trigger: approval_confirmed received in WAIT_MEETING_CONFIRMATION\n"
+            "Actions:\n"
+            "- Set next_step = WAIT_READINESS_CONFIRMATIONS\n"
+            "- Build readiness message text:\n"
+            '  "Релиз <https://instories.atlassian.net/issues/?jql=fixVersion={version}|{version}>\n\n'
+            '  Статус готовности к срезу:\n'
+            '  {for each team in readiness_owners: ":hourglass_flowing_sand: {team} {owner_mention}\n"}\n\n'
+            '  Напишите в треде по готовности своей части.\n\n'
+            '  *Важное напоминание* – все задачи, не влитые в ветку RC до 15:00 МСК '
+            '  едут в релиз только после одобрения QA"\n'
+            "- Add slack_message with readiness text, save thread_ts from response\n"
+            "- Return flow_lifecycle='paused'\n\n"
+            "### 6. WAIT_READINESS_CONFIRMATIONS handling\n"
+            "For each 'message' event in readiness thread:\n"
+            "- Check event.thread_ts matches readiness thread\n"
+            "- Normalize text: lowercase, remove special chars except spaces\n"
+            "- Positive markers: 'готов', 'ready', 'done', 'ok', 'merged', 'влит', 'смержен'\n"
+            "- Negative markers: 'не готов', 'not ready', 'blocked', 'блокер'\n"
+            "- Skip messages with negative markers\n"
+            "- For positive messages, match readiness point:\n"
+            "  * Check if point name/alias appears in message text\n"
+            "  * OR check if message user's ID matches point owner's mention\n"
+            "- Update readiness_map[point] = true for matched points\n"
+            "- Do NOT send standalone slack_message acknowledgements per readiness confirmation\n"
+            "- Instead, send slack_update for the original readiness checklist message_ts and update only affected lines:\n"
+            "  * matched points -> ':white_check_mark:'\n"
+            "  * unmatched points remain ':hourglass_flowing_sand:'\n"
+            "- If ALL points from config.readiness_owners are true:\n"
+            "  * Set next_step = READY_FOR_BRANCH_CUT\n"
+            '  * Add exactly ONE slack_message tool call with text: "Можно выделять RC ветку"\n'
+            "  * Return flow_lifecycle='running'\n"
+            "- Otherwise stay in WAIT_READINESS_CONFIRMATIONS with flow_lifecycle='paused'\n\n"
+            "### 7. READY_FOR_BRANCH_CUT\n"
+            "Trigger: All readiness points confirmed\n"
+            "Actions:\n"
+            "- Set flow_lifecycle='completed'\n"
+            "- Clear flow_execution_id\n"
+            "- Keep active_release for reference (don't delete)\n\n"
+            "## Output Format\n\n"
+            "Return valid JSON matching AgentDecision schema. Example:\n\n"
+            '{\n'
+            '  "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",\n'
+            '  "next_state": {\n'
+            '    "active_release": {\n'
+            '      "release_version": "5.105.0",\n'
+            '      "step": "WAIT_MANUAL_RELEASE_CONFIRMATION",\n'
+            '      "readiness_map": {},\n'
+            '      "message_ts": {},\n'
+            '      "thread_ts": {}\n'
+            '    },\n'
+            '    "flow_execution_id": "uuid-here",\n'
+            '    "flow_paused_at": "2026-02-27T16:00:00+00:00"\n'
+            '  },\n'
+            '  "tool_calls": [\n'
+            '    {\n'
+            '      "tool": "slack_approve",\n'
+            '      "reason": "Request release creation confirmation",\n'
+            '      "args": {\n'
+            '        "channel_id": "C123",\n'
+            '        "text": "Подтвердите создание релиза 5.105.0 в JIRA",\n'
+            '        "approve_label": "Подтвердить"\n'
+            '      }\n'
+            '    }\n'
+            '  ],\n'
+            '  "audit_reason": "created_release_request",\n'
+            '  "flow_lifecycle": "paused"\n'
+            '}\n\n'
+            "## Important Notes\n\n"
+            "- Always validate step transitions are allowed\n"
+            "- Use next_state for complete state, state_patch only for partial updates\n"
+            "- Include all required tool fields in args\n"
+            "- Never use 'functions.' prefix in tool names\n"
+            "- flow_lifecycle='paused' requires flow_execution_id to be set\n"
+            "- After approval_confirmed, always send slack_update to mark the approval message\n"
+            "- If you are uncertain, return conservative no-op (same step/state, empty tool_calls) with explicit audit_reason"
         ),
     }

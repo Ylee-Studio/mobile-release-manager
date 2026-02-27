@@ -12,12 +12,6 @@ from typing import Any
 from urllib.parse import quote
 
 from .runtime_engine import RuntimeCoordinator, RuntimeDecision
-from .state_machine import (
-    StateMachineEngine,
-    extract_latest_approval_event,
-    has_approval_confirmed,
-    pending_key_from_event,
-)
 from .state_store import WorkflowStateStore
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
 from .tools.slack_tools import (
@@ -67,7 +61,6 @@ class ReleaseWorkflow:
         self.runtime_engine = runtime_engine or legacy_runtime
         if self.runtime_engine is None:
             raise RuntimeError("runtime engine is required")
-        self.state_machine = StateMachineEngine()
         self.audit_log_path = Path(config.audit_log_path)
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("release_workflow")
@@ -82,11 +75,11 @@ class ReleaseWorkflow:
         state = WorkflowState.from_dict(self._state.to_dict())
         previous_state = WorkflowState.from_dict(state.to_dict())
         events = self.slack_gateway.poll_events()
-        queue_remaining = self.slack_gateway.pending_events_count()
         trace_id = str(uuid.uuid4())
-        self._add_processing_reactions(events=events)
 
-        decision = self._run_runtime_decision(
+        self.logger.info("processing events: %s", events)
+
+        decision = self.start_or_continue_release(
             state=state,
             events=events,
             now=now,
@@ -110,10 +103,12 @@ class ReleaseWorkflow:
                 actor=decision.actor,
                 tool_calls=[],
             )
+        self._add_processing_reactions(events=events)
         self._execute_tool_calls(decision=decision, events=events)
         next_state = decision.next_state
         self.state_store.save(state=next_state, reason=decision.audit_reason)
         self._state = WorkflowState.from_dict(next_state.to_dict())
+        queue_remaining = self.slack_gateway.pending_events_count()
         self._append_audit(
             trace_id=trace_id,
             previous_state=previous_state,
@@ -129,65 +124,6 @@ class ReleaseWorkflow:
             queue_remaining,
         )
         return next_state
-
-    def _run_runtime_decision(
-        self,
-        *,
-        state: WorkflowState,
-        events: list[Any],
-        now: datetime | None,
-        trigger_reason: str,
-    ) -> RuntimeDecision:
-        gate_outcome = self.state_machine.apply_deterministic_gates(
-            state=state,
-            events=events,
-            readiness_owners=self.config.readiness_owners,
-        )
-        if gate_outcome is not None:
-            return RuntimeDecision(
-                next_step=gate_outcome.next_step,
-                next_state=gate_outcome.next_state,
-                audit_reason=gate_outcome.audit_reason,
-                actor=gate_outcome.actor,
-                flow_lifecycle=gate_outcome.flow_lifecycle,
-            )
-
-        if state.is_paused and has_approval_confirmed(events):
-            approval_event = extract_latest_approval_event(events)
-            pending_key = pending_key_from_event(approval_event)
-            flow_id = str(state.flow_execution_id or "").strip()
-            if not flow_id:
-                return RuntimeDecision(
-                    next_step=state.step,
-                    next_state=state,
-                    audit_reason=f"flow_id_lookup_status:missing;pending_key:{pending_key}",
-                    actor="flow_runtime",
-                    flow_lifecycle="paused",
-                )
-            feedback = str(getattr(extract_latest_approval_event(events), "text", "") or "").strip()
-            resume_decision = self.runtime_engine.resume_from_pending(
-                flow_id=flow_id,
-                feedback=feedback,
-                state=state,
-            )
-            if resume_decision.flow_lifecycle == "error":
-                return resume_decision
-            decision = self.start_or_continue_release(
-                state=state,
-                events=events,
-                now=now,
-                trigger_reason=trigger_reason,
-            )
-            decision.audit_reason = (
-                f"flow_id_lookup_status:state;pending_key:{pending_key};{decision.audit_reason}"
-            )
-            return decision
-        return self.start_or_continue_release(
-            state=state,
-            events=events,
-            now=now,
-            trigger_reason=trigger_reason,
-        )
 
     def start_or_continue_release(
         self,
@@ -216,21 +152,6 @@ class ReleaseWorkflow:
                 trigger_reason=trigger_reason,
             )
         raise RuntimeError("runtime engine must provide kickoff() or decide()")
-
-    def resume_on_event(
-        self,
-        *,
-        state: WorkflowState,
-        events: list[Any],
-        now: datetime | None,
-        trigger_reason: str,
-    ) -> RuntimeDecision:
-        return self.start_or_continue_release(
-            state=state,
-            events=events,
-            now=now,
-            trigger_reason=trigger_reason,
-        )
 
     def _add_processing_reactions(self, *, events: list[Any]) -> None:
         for event in events:
@@ -399,6 +320,74 @@ class ReleaseWorkflow:
             self.logger.warning("skip slack_message: empty text after validation")
             return
 
+        readiness_item = _readiness_item_from_audit_reason(decision.audit_reason)
+        if (
+            release is not None
+            and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+            and readiness_item
+        ):
+            checklist_ts = (
+                str(release.thread_ts.get("readiness", "") or "").strip()
+                or str(release.thread_ts.get("generic_message", "") or "").strip()
+                or str(release.message_ts.get("generic_message", "") or "").strip()
+            )
+            if checklist_ts:
+                channel_id = (
+                    str(args.get("channel_id") or "").strip()
+                    or release.slack_channel_id
+                    or _extract_event_channel_id(events)
+                    or self.config.slack_channel_id
+                )
+                if not channel_id:
+                    self.logger.warning(
+                        "skip readiness checklist update: empty channel_id for release=%s",
+                        release.release_version,
+                    )
+                    return
+                checklist_text = _build_readiness_checklist_text(
+                    release_version=release.release_version,
+                    readiness_owners=self.config.readiness_owners,
+                    readiness_map=release.readiness_map,
+                )
+                decision.next_state.checkpoints.append(
+                    {
+                        "phase": "before",
+                        "tool": "slack_update",
+                        "release_version": release.release_version,
+                        "step": decision.next_step.value,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                try:
+                    self.slack_gateway.update_message(
+                        channel_id=channel_id,
+                        message_ts=checklist_ts,
+                        text=checklist_text,
+                    )
+                except Exception as exc:  # pragma: no cover - runtime safety
+                    self.logger.exception(
+                        "readiness checklist update failed for release=%s: %s",
+                        release.release_version,
+                        exc,
+                    )
+                    return
+                release.slack_channel_id = channel_id
+                decision.next_state.checkpoints.append(
+                    {
+                        "phase": "after",
+                        "tool": "slack_update",
+                        "release_version": release.release_version,
+                        "step": decision.next_step.value,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            else:
+                self.logger.warning(
+                    "skip readiness checklist update: empty message_ts for release=%s",
+                    release.release_version,
+                )
+            return
+
         if release is not None and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
             text = _normalize_readiness_message_text(
                 text=text,
@@ -446,7 +435,8 @@ class ReleaseWorkflow:
                 thread_ts=thread_ts_value,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
-            self.logger.exception("slack_message failed for release=%s: %s", release.release_version, exc)
+            release_version = release.release_version if release else "n/a"
+            self.logger.exception("slack_message failed for release=%s: %s", release_version, exc)
             return
 
         message_ts = str(result.get("message_ts", "")).strip()
@@ -501,11 +491,16 @@ class ReleaseWorkflow:
             return
 
         text = str(args.get("text") or "").strip()
-        if not text and approval_event is not None:
+        if approval_event is not None:
             metadata = getattr(approval_event, "metadata", None)
+            trigger_message_text = ""
             if isinstance(metadata, dict):
-                text = str(metadata.get("trigger_message_text") or "").strip()
-        if text and not text.endswith(":white_check_mark:"):
+                trigger_message_text = str(metadata.get("trigger_message_text") or "").strip()
+            text = _with_approval_suffix(
+                base_text=trigger_message_text or text,
+                suffix="Подтверждено :white_check_mark:",
+            )
+        elif text and not text.endswith(":white_check_mark:"):
             text = f"{text} :white_check_mark:"
         if not text:
             self.logger.warning("skip slack_update: empty text for release=%s", release.release_version)
@@ -688,6 +683,18 @@ def _extract_latest_approval_event(events: list[Any]) -> Any | None:
     return None
 
 
+def _with_approval_suffix(*, base_text: str, suffix: str) -> str:
+    normalized_base = str(base_text or "").strip()
+    normalized_suffix = str(suffix or "").strip()
+    if not normalized_suffix:
+        return normalized_base
+    if not normalized_base:
+        return normalized_suffix
+    if normalized_base.endswith(normalized_suffix):
+        return normalized_base
+    return f"{normalized_base}\n\n{normalized_suffix}"
+
+
 def _extract_latest_message_thread_ts(events: list[Any]) -> str:
     for event in reversed(events):
         if str(getattr(event, "event_type", "")).strip() != "message":
@@ -699,126 +706,6 @@ def _extract_latest_message_thread_ts(events: list[Any]) -> str:
         if message_ts:
             return message_ts
     return ""
-
-
-def _normalize_readiness_map(
-    *,
-    readiness_map: dict[str, Any],
-    required_points: list[str],
-) -> dict[str, bool]:
-    normalized: dict[str, bool] = {point: False for point in required_points}
-    if not isinstance(readiness_map, dict):
-        return normalized
-    for point in required_points:
-        normalized[point] = bool(readiness_map.get(point) is True)
-    return normalized
-
-
-def _readiness_thread_ts(release: Any) -> str:
-    thread_ts = str(release.thread_ts.get("generic_message", "") or "").strip()
-    if thread_ts:
-        return thread_ts
-    return str(release.message_ts.get("generic_message", "") or "").strip()
-
-
-def _is_readiness_thread_message(*, event: Any, readiness_thread_ts: str) -> bool:
-    if str(getattr(event, "event_type", "")).strip() != "message":
-        return False
-    if not readiness_thread_ts:
-        return False
-    thread_ts = str(getattr(event, "thread_ts", "") or "").strip()
-    message_ts = str(getattr(event, "message_ts", "") or "").strip()
-    if thread_ts != readiness_thread_ts:
-        return False
-    # Ignore root readiness announcement; only process replies in thread.
-    return message_ts != readiness_thread_ts
-
-
-def _is_readiness_confirmation_text(text: str) -> bool:
-    normalized = _normalize_text(text)
-    if not normalized:
-        return False
-    negative_markers = ("не готов", "not ready", "blocked", "блокер", "блокируется")
-    if any(marker in normalized for marker in negative_markers):
-        return False
-    positive_markers = (
-        "готов",
-        "готово",
-        "готовы",
-        "готова",
-        "ready",
-        "done",
-        "ok",
-        "okay",
-        "влит",
-        "влито",
-        "merged",
-        "смержен",
-        "смёржен",
-    )
-    return any(marker in normalized for marker in positive_markers)
-
-
-def _extract_confirmed_readiness_points(
-    *,
-    text: str,
-    readiness_owners: dict[str, str],
-    metadata: Any,
-) -> set[str]:
-    confirmed: set[str] = set()
-    normalized_text = _normalize_text(text)
-    user_id = _event_user_id(metadata)
-    for point, owner_mention in readiness_owners.items():
-        aliases = _readiness_point_aliases(point)
-        if any(alias in normalized_text for alias in aliases):
-            confirmed.add(point)
-            continue
-        owner_id = _extract_slack_user_id(owner_mention)
-        if owner_id and user_id and owner_id == user_id:
-            confirmed.add(point)
-    return confirmed
-
-
-def _readiness_point_aliases(point: str) -> tuple[str, ...]:
-    normalized_point = _normalize_text(point)
-    aliases: list[str] = [normalized_point]
-    mapping: dict[str, tuple[str, ...]] = {
-        "growth": ("growth",),
-        "core": ("core",),
-        "autocut": ("autocut", "auto cut"),
-        "ai tools": ("ai tools", "aitools", "ai"),
-        "activation": ("activation",),
-        "влит релиз движка в dev": ("движка", "движок", "engine"),
-        "влит релиз featureskit в dev": ("featureskit", "feature kit", "фичерскит"),
-    }
-    extra_aliases = mapping.get(normalized_point, ())
-    for alias in extra_aliases:
-        normalized_alias = _normalize_text(alias)
-        if normalized_alias and normalized_alias not in aliases:
-            aliases.append(normalized_alias)
-    return tuple(aliases)
-
-
-def _extract_slack_user_id(owner_mention: str) -> str:
-    text = str(owner_mention or "").strip()
-    match = re.fullmatch(r"<@([A-Z0-9]+)>", text, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    return match.group(1).upper()
-
-
-def _event_user_id(metadata: Any) -> str:
-    if not isinstance(metadata, dict):
-        return ""
-    user_id = str(metadata.get("user_id", "") or "").strip()
-    return user_id.upper()
-
-
-def _normalize_text(value: str) -> str:
-    normalized = str(value or "").lower()
-    normalized = normalized.replace("ё", "е")
-    normalized = re.sub(r"[^a-zа-я0-9]+", " ", normalized)
-    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def _readiness_jql_query(release_version: str) -> str:
@@ -834,9 +721,25 @@ def _format_slack_owner_mention(owner: str) -> str:
     normalized = str(owner or "").strip()
     if not normalized:
         return normalized
-    if normalized.startswith("<@") and normalized.endswith(">"):
+    if normalized.startswith("<!subteam^") and normalized.endswith(">"):
         return normalized
+    if normalized.startswith("<#") and normalized.endswith(">"):
+        return normalized
+    if normalized.startswith("<@") and normalized.endswith(">"):
+        entity_id = normalized[2:-1].strip()
+        if re.fullmatch(r"[CDG][A-Z0-9]+", entity_id):
+            return f"<#{entity_id}>"
+        return normalized
+    if re.fullmatch(r"[UW][A-Z0-9]+", normalized):
+        return f"<@{normalized}>"
+    if re.fullmatch(r"S[A-Z0-9]+", normalized):
+        return f"<!subteam^{normalized}>"
+    if re.fullmatch(r"[CDG][A-Z0-9]+", normalized):
+        return f"<#{normalized}>"
     if normalized.startswith("@"):
+        mention_id = normalized[1:].strip()
+        if re.fullmatch(r"[UW][A-Z0-9]+", mention_id):
+            return f"<@{mention_id}>"
         return normalized
     return f"@{normalized}"
 
@@ -885,18 +788,40 @@ def _normalize_readiness_message_text(
     normalized_message = "\n".join(lines)
     normalized_message = re.sub(
         r"\*{0,2}Важное напоминание\*{0,2}",
-        "**Важное напоминание**",
+        "*Важное напоминание*",
         normalized_message,
         count=1,
     )
     return normalized_message
 
 
-def _has_approval_confirmed(events: list[Any]) -> bool:
-    for event in events:
-        if str(getattr(event, "event_type", "")).strip() == "approval_confirmed":
-            return True
-    return False
+def _build_readiness_checklist_text(
+    *,
+    release_version: str,
+    readiness_owners: dict[str, str],
+    readiness_map: dict[str, bool],
+) -> str:
+    readiness_lines = []
+    for team, owner in readiness_owners.items():
+        is_ready = bool(readiness_map.get(team, False))
+        emoji = ":white_check_mark:" if is_ready else ":hourglass_flowing_sand:"
+        readiness_lines.append(f"{emoji} {team} {_format_slack_owner_mention(owner)}")
+    return (
+        f"Релиз <{_readiness_issues_url(release_version)}|{release_version}>\n\n"
+        "Статус готовности к срезу:\n"
+        + "\n".join(readiness_lines)
+        + "\n\n"
+        "Напишите в треде по готовности своей части.\n\n"
+        "*Важное напоминание* – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "едут в релиз только после одобрения QA"
+    )
+
+
+def _readiness_item_from_audit_reason(audit_reason: str) -> str:
+    match = re.search(r"readiness_confirmation:([^\s;]+)", str(audit_reason or ""))
+    if not match:
+        return ""
+    return match.group(1).strip()
 
 
 def _flow_event_from_lifecycle(lifecycle: str) -> str:
@@ -908,14 +833,6 @@ def _flow_event_from_lifecycle(lifecycle: str) -> str:
     if normalized == "running":
         return "flow_resumed"
     return "flow_transition"
-
-
-def _pending_key_from_event(event: Any | None) -> str:
-    if event is None:
-        return ""
-    message_ts = str(getattr(event, "message_ts", "") or "").strip()
-    thread_ts = str(getattr(event, "thread_ts", "") or "").strip()
-    return message_ts or thread_ts
 
 
 def _audit_field(audit_reason: str, key: str) -> str | None:

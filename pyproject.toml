@@ -9,6 +9,9 @@ dependencies = [
     "rich>=13.7.1",
     "pyyaml>=6.0.1",
     "slack-sdk>=3.40.1",
+    "python-dotenv>=1.0.0",
+    "pydantic-ai>=0.0.15",
+    "nest-asyncio>=1.5.0",
 ]
 
 [project.optional-dependencies]

@@ -1,22 +1,30 @@
-"""Deterministic runtime coordinator without CrewAI."""
+"""Deterministic runtime coordinator with Pydantic AI integration."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from .agents import build_flow_agent
 from .policies import PolicyConfig
-from .runtime_contracts import AgentDecisionPayload
+from .runtime_contracts import AgentDecisionPayload, ToolCallPayload
 from .tasks import build_flow_task
 from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
 from .tools.slack_tools import SlackApproveInput, SlackEvent, SlackGateway, SlackMessageInput, SlackUpdateInput
-from .workflow_state import ReleaseStep, WorkflowState
-
+from .workflow_state import (
+    ReleaseStep,
+    WorkflowState,
+)
 
 class RuntimeDecision(BaseModel):
     """Runtime decision contract."""
@@ -151,15 +159,6 @@ class RuntimeCoordinator:
         now: datetime | None = None,
         trigger_reason: str = "event_trigger",
     ) -> RuntimeDecision:
-        if state.is_paused and not _has_resume_event(events):
-            return RuntimeDecision(
-                next_step=state.step,
-                next_state=state,
-                audit_reason=f"flow_paused_waiting_confirmation:{state.pause_reason or 'unknown'}",
-                actor="flow_runtime",
-                flow_lifecycle="paused",
-            )
-
         payload = {
             "state": state.to_dict(),
             "events": [self._event_to_dict(event) for event in events],
@@ -194,6 +193,8 @@ class RuntimeCoordinator:
                 next_step=state.step,
                 next_state=state,
                 audit_reason=f"runtime_error:{exc.__class__.__name__}",
+                tool_calls=[],
+                actor="flow_runtime",
                 flow_lifecycle="error",
             )
 
@@ -284,41 +285,139 @@ class RuntimeCoordinator:
         }
 
 
+class AgentDecision(BaseModel):
+    """Structured output from Pydantic AI agent.
+
+    This model defines the expected response structure from the LLM.
+    Pydantic AI automatically validates the response against this schema.
+
+    Note: next_step is str (not ReleaseStep) because Pydantic AI expects
+    simple types for result_type validation. We convert to ReleaseStep later.
+    """
+    next_step: str
+    next_state: dict[str, Any] = Field(default_factory=dict)
+    state_patch: dict[str, Any] = Field(default_factory=dict)
+    tool_calls: list[ToolCallPayload] = Field(default_factory=list)
+    audit_reason: str = "agent_decision"
+    flow_lifecycle: str = "running"
+
+
 class DirectLLMRuntime:
-    """Direct decision runtime with deterministic fallback contract."""
+    """Direct decision runtime using Pydantic AI for LLM calls."""
 
     def __init__(self, *, policy: PolicyConfig) -> None:
         self.policy = policy
+        self._agent = self._build_agent()
 
-    def decide(
+    def _build_agent(self) -> Agent:
+        """Build Pydantic AI agent with structured output."""
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        # OpenAIModel uses provider to pass api_key explicitly
+        provider = OpenAIProvider(api_key=api_key)
+        model = OpenAIModel(model_name, provider=provider)
+
+        return Agent(
+            model=model,
+            output_type=AgentDecision,
+            system_prompt="You are a release workflow orchestrator. Make decisions about workflow state transitions.",
+            retries=3,  # Auto-retry on validation errors
+        )
+
+    def _build_user_prompt(
         self,
         *,
-        state: WorkflowState,
-        events: list[SlackEvent],
-        config: Any,
-        now: datetime | None = None,
-        trigger_reason: str = "event_trigger",
-    ) -> RuntimeDecision:
-        _ = (events, config, now, trigger_reason, self.policy)
-        return RuntimeDecision(
-            next_step=state.step,
-            next_state=WorkflowState.from_dict(state.to_dict()),
-            audit_reason="no_transition",
-            actor="flow_agent",
-            flow_lifecycle="running",
-        )
+        payload: dict[str, Any],
+        task: dict[str, Any] | None = None,
+    ) -> str:
+        """Build user prompt from payload and task description."""
+        task = task or {}
+        description = str(task.get("description", ""))
+
+        # Build context section with JSON-serialized values
+        context_parts = [
+            "## Input Context",
+            "",
+            f"state: {json.dumps(payload.get('state', {}), ensure_ascii=False)}",
+            f"events: {json.dumps(payload.get('events', []), ensure_ascii=False)}",
+            f"config: {json.dumps(payload.get('config', {}), ensure_ascii=False)}",
+            f"now_iso: {payload.get('now_iso', '')}",
+            f"trigger_reason: {payload.get('trigger_reason', 'event_trigger')}",
+            "",
+        ]
+        context = "\n".join(context_parts)
+
+        # Combine context with task description
+        return context + description
+
+    def _run_agent_sync(
+        self,
+        payload: dict[str, Any],
+        task: dict[str, Any] | None = None,
+    ) -> AgentDecision:
+        """Run Pydantic AI agent synchronously.
+
+        Uses get_event_loop().run_until_complete() to safely handle
+        both sync and async contexts without creating nested event loops.
+        """
+        import nest_asyncio
+        nest_asyncio.apply()
+
+        prompt = self._build_user_prompt(payload=payload, task=task)
+
+        # Get or create event loop and run async agent
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context, use nest_asyncio
+                result = asyncio.run(self._agent.run(prompt))
+            else:
+                result = loop.run_until_complete(self._agent.run(prompt))
+        except RuntimeError:
+            # No event loop, create one
+            result = asyncio.run(self._agent.run(prompt))
+
+        return result.output
 
     def decide_payload(self, *, payload: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
-        _ = task
-        state = WorkflowState.from_dict(payload.get("state", {}))
-        decision = self.decide(
-            state=state,
-            events=[],
-            config=payload.get("config", {}),
-            now=None,
-            trigger_reason=str(payload.get("trigger_reason", "event_trigger")),
-        )
-        return decision.to_dict()
+        """Main entry point: call Pydantic AI agent and return decision."""
+        current_state = WorkflowState.from_dict(payload.get("state", {}))
+
+        try:
+            # Get structured decision from Pydantic AI
+            agent_decision = self._run_agent_sync(payload, task)
+
+            # Convert tool_calls from ToolCallPayload objects to dicts
+            tool_calls_dicts = [tc.model_dump() for tc in agent_decision.tool_calls]
+
+            # Convert AgentDecision to RuntimeDecision
+            # next_step is already a string, no need for .value
+            decision = RuntimeDecision.from_payload(
+                {
+                    "next_step": agent_decision.next_step,
+                    "next_state": agent_decision.next_state or current_state.to_dict(),
+                    "state_patch": agent_decision.state_patch,
+                    "tool_calls": tool_calls_dicts,
+                    "audit_reason": agent_decision.audit_reason,
+                    "flow_lifecycle": agent_decision.flow_lifecycle,
+                },
+                current_state=current_state,
+                actor="flow_agent",
+            )
+            return decision.to_dict()
+
+        except Exception as exc:
+            logging.getLogger("runtime_engine").exception("Pydantic AI agent failed: %s", exc)
+            return RuntimeDecision(
+                next_step=current_state.step,
+                next_state=current_state,
+                audit_reason=f"agent_error:{exc.__class__.__name__}",
+                actor="flow_agent",
+                flow_lifecycle="error",
+            ).to_dict()
 
 
 class _CompatFlow:
@@ -438,17 +537,4 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
             out[key] = value
     return out
 
-
-def _has_resume_event(events: Any) -> bool:
-    if not isinstance(events, list):
-        return False
-    for event in events:
-        event_type = ""
-        if isinstance(event, dict):
-            event_type = str(event.get("event_type", "")).strip()
-        else:
-            event_type = str(getattr(event, "event_type", "")).strip()
-        if event_type == "approval_confirmed":
-            return True
-    return False
 

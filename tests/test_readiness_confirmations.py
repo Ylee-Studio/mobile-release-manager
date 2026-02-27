@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from src.release_workflow import ReleaseWorkflow, RuntimeConfig
+from src.runtime_engine import RuntimeDecision
 from src.tools.slack_tools import SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
@@ -12,11 +14,6 @@ from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 READINESS_OWNERS = {
     "Growth": "<@U00000001>",
     "Core": "<@U00000002>",
-    "AutoCut": "<@U00000003>",
-    "AI Tools": "<@U00000004>",
-    "Activation": "<@U00000005>",
-    "Влит релиз Движка в dev": "<@U00000006>",
-    "Влит релиз FeaturesKit в dev": "<@U00000007>",
 }
 
 
@@ -58,12 +55,17 @@ class _InMemoryNativeMemory:
         ]
 
 
-class _FailIfCalledCrewRuntime:
-    def kickoff(self, **kwargs):  # noqa: ANN003
-        raise AssertionError(f"runtime engine must not be called in readiness gate: {kwargs}")
+@dataclass
+class _RecordingRuntime:
+    decisions: list[RuntimeDecision]
+    received_events: list[list[Any]] = field(default_factory=list)
 
-    def resume_from_pending(self, **kwargs):  # noqa: ANN003
-        raise AssertionError(f"resume_from_pending must not be called in readiness gate: {kwargs}")
+    def kickoff(self, *, state, events, config, now=None, trigger_reason="event_trigger"):  # noqa: ANN001
+        _ = (state, config, now, trigger_reason)
+        self.received_events.append(events)
+        if self.decisions:
+            return self.decisions.pop(0)
+        raise AssertionError("no scripted decision left for runtime")
 
 
 def _seed_wait_readiness_state(memory: _InMemoryNativeMemory) -> None:
@@ -74,7 +76,7 @@ def _seed_wait_readiness_state(memory: _InMemoryNativeMemory) -> None:
             slack_channel_id="C_RELEASE",
             message_ts={"generic_message": "177.700"},
             thread_ts={"generic_message": "177.700"},
-            readiness_map={},
+            readiness_map={"Growth": False, "Core": False},
         ),
         flow_execution_id="flow-readiness-1",
         flow_paused_at="2026-02-27T10:00:00+00:00",
@@ -103,7 +105,7 @@ def _message_event(*, event_id: str, text: str, user_id: str = "U99999999") -> d
     }
 
 
-def _build_workflow(tmp_path: Path) -> tuple[ReleaseWorkflow, Path]:
+def _build_workflow(tmp_path: Path, *, runtime: _RecordingRuntime) -> tuple[ReleaseWorkflow, Path]:
     cfg = _runtime_config(tmp_path)
     memory = _InMemoryNativeMemory()
     _seed_wait_readiness_state(memory)
@@ -112,70 +114,78 @@ def _build_workflow(tmp_path: Path) -> tuple[ReleaseWorkflow, Path]:
         config=cfg,
         memory=memory,
         slack_gateway=gateway,
-        legacy_runtime=_FailIfCalledCrewRuntime(),
+        legacy_runtime=runtime,
     )
     return workflow, Path(cfg.slack_events_path)
 
 
-def test_wait_readiness_ignores_invalid_and_duplicate_confirmations(tmp_path: Path) -> None:
-    workflow, events_path = _build_workflow(tmp_path)
-
-    _append_event(events_path, _message_event(event_id="1", text="Growth не готов"))
-    state = workflow.tick(trigger_reason="signal_trigger")
-    assert state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
-    assert state.active_release is not None
-    assert state.active_release.readiness_map["Growth"] is False
-
-    _append_event(events_path, _message_event(event_id="2", text="Growth готов"))
-    state = workflow.tick(trigger_reason="signal_trigger")
-    assert state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
-    assert state.active_release is not None
-    assert state.active_release.readiness_map["Growth"] is True
-
-    _append_event(events_path, _message_event(event_id="3", text="Growth готов"))
-    state = workflow.tick(trigger_reason="signal_trigger")
-    assert state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
-    assert state.active_release is not None
-    assert state.active_release.readiness_map["Growth"] is True
-
-
-def test_wait_readiness_moves_to_next_state_only_after_all_seven_confirmed(tmp_path: Path) -> None:
-    workflow, events_path = _build_workflow(tmp_path)
-    confirmations = [
-        ("1", "Growth готов"),
-        ("2", "Core готово"),
-        ("3", "AutoCut ready"),
-        ("4", "AI Tools done"),
-        ("5", "Activation ok"),
-        ("6", "Влит релиз Движка в dev готов"),
-        ("7", "Влит релиз FeaturesKit в dev готово"),
-    ]
-
-    for idx, (event_id, text) in enumerate(confirmations, start=1):
-        _append_event(events_path, _message_event(event_id=event_id, text=text))
-        state = workflow.tick(trigger_reason="signal_trigger")
-        assert state.active_release is not None
-        if idx < len(confirmations):
-            assert state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
-            assert state.is_paused is True
-        else:
-            assert state.step == ReleaseStep.READY_FOR_BRANCH_CUT
-            assert state.is_paused is False
-
-    final_map = state.active_release.readiness_map
-    assert set(final_map.keys()) == set(READINESS_OWNERS.keys())
-    assert all(final_map[point] is True for point in READINESS_OWNERS)
-
-
-def test_wait_readiness_accepts_owner_message_without_team_name(tmp_path: Path) -> None:
-    workflow, events_path = _build_workflow(tmp_path)
-
-    _append_event(
-        events_path,
-        _message_event(event_id="8", text="готово", user_id="U00000001"),
+def test_wait_readiness_state_follows_agent_decision_payload(tmp_path: Path) -> None:
+    decision_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.104.0",
+            step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+            slack_channel_id="C_RELEASE",
+            message_ts={"generic_message": "177.700"},
+            thread_ts={"generic_message": "177.700"},
+            readiness_map={"Growth": True, "Core": False},
+        ),
+        flow_execution_id="flow-readiness-1",
+        flow_paused_at="2026-02-27T10:00:00+00:00",
+        pause_reason="agent_waiting_readiness",
     )
+    runtime = _RecordingRuntime(
+        decisions=[
+            RuntimeDecision(
+                next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                next_state=decision_state,
+                audit_reason="agent_readiness_partial",
+                actor="flow_agent",
+                flow_lifecycle="paused",
+            )
+        ]
+    )
+    workflow, events_path = _build_workflow(tmp_path, runtime=runtime)
+    _append_event(events_path, _message_event(event_id="1", text="Growth готов"))
+
     state = workflow.tick(trigger_reason="signal_trigger")
 
+    assert len(runtime.received_events) == 1
     assert state.step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
     assert state.active_release is not None
-    assert state.active_release.readiness_map["Growth"] is True
+    assert state.active_release.readiness_map == {"Growth": True, "Core": False}
+
+
+def test_wait_readiness_transition_to_ready_for_branch_cut_is_agent_driven(tmp_path: Path) -> None:
+    decision_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.104.0",
+            step=ReleaseStep.READY_FOR_BRANCH_CUT,
+            slack_channel_id="C_RELEASE",
+            message_ts={"generic_message": "177.700"},
+            thread_ts={"generic_message": "177.700"},
+            readiness_map={"Growth": True, "Core": True},
+        ),
+        flow_execution_id=None,
+        flow_paused_at=None,
+        pause_reason=None,
+    )
+    runtime = _RecordingRuntime(
+        decisions=[
+            RuntimeDecision(
+                next_step=ReleaseStep.READY_FOR_BRANCH_CUT,
+                next_state=decision_state,
+                audit_reason="agent_readiness_complete",
+                actor="flow_agent",
+                flow_lifecycle="completed",
+            )
+        ]
+    )
+    workflow, events_path = _build_workflow(tmp_path, runtime=runtime)
+    _append_event(events_path, _message_event(event_id="2", text="Core готов"))
+
+    state = workflow.tick(trigger_reason="signal_trigger")
+
+    assert len(runtime.received_events) == 1
+    assert state.step == ReleaseStep.READY_FOR_BRANCH_CUT
+    assert state.active_release is not None
+    assert state.active_release.readiness_map == {"Growth": True, "Core": True}

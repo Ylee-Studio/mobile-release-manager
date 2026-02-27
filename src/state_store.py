@@ -10,7 +10,7 @@ from .workflow_state import WorkflowState
 
 
 class WorkflowStateStore:
-    """Simple JSONL-backed state store without CrewAI memory."""
+    """Simple JSONL-backed state store."""
 
     def __init__(self, *, state_path: str):
         self.state_path = Path(state_path)

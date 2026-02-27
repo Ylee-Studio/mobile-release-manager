@@ -237,7 +237,7 @@ def test_validation_accepts_readiness_slack_message_with_required_sections() -> 
         "Статус готовности к срезу:\n"
         ":hourglass_flowing_sand: Growth @owner\n\n"
         "Напишите в треде по готовности своей части.\n"
-        "**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "*Важное напоминание* – все задачи, не влитые в ветку RC до 15:00 МСК "
         "едут в релиз только после одобрения QA"
     )
     tool_calls = [

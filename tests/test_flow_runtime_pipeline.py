@@ -11,7 +11,7 @@ from src.release_workflow import (
     RuntimeConfig,
     _normalize_readiness_message_text,
 )
-from src.tools.slack_tools import SlackGateway
+from src.tools.slack_tools import SlackEvent, SlackGateway
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
 
@@ -81,6 +81,17 @@ class _InMemoryNativeMemory:
         ]
 
 
+@dataclass
+class _NoopStateStore:
+    state: WorkflowState
+
+    def load(self) -> WorkflowState:
+        return self.state
+
+    def save(self, *, state: WorkflowState, reason: str) -> None:  # noqa: ARG002
+        self.state = state
+
+
 def _seed_state(memory: _InMemoryNativeMemory, state: WorkflowState, *, reason: str = "seed") -> None:
     memory.remember(
         content="{}",
@@ -104,6 +115,56 @@ def test_release_workflow_propagates_trigger_reason_to_runtime(tmp_path: Path) -
 
     assert state.step == ReleaseStep.IDLE
     assert runtime.trigger_reason == "signal_trigger"
+
+
+def test_release_workflow_calls_decision_before_processing_reaction(tmp_path: Path) -> None:
+    call_order: list[str] = []
+
+    class _OrderedSlackGateway:
+        def poll_events(self) -> list[SlackEvent]:
+            call_order.append("poll_events")
+            return [
+                SlackEvent(
+                    event_id="evt-1",
+                    event_type="message",
+                    channel_id="C_RELEASE",
+                    text="start",
+                    message_ts="1700000000.123456",
+                )
+            ]
+
+        def add_reaction(self, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:  # noqa: ARG002
+            call_order.append("add_reaction")
+            return True
+
+        def pending_events_count(self) -> int:
+            call_order.append("pending_events_count")
+            return 0
+
+    class _OrderedRuntime:
+        def kickoff(self, *, state, events, config, now=None, trigger_reason="event_trigger"):  # noqa: ANN001
+            _ = (events, config, now, trigger_reason)
+            call_order.append("kickoff")
+            return RuntimeDecision(
+                next_step=state.step,
+                next_state=state,
+                audit_reason="ordered",
+                actor="flow_agent",
+                flow_lifecycle="running",
+            )
+
+    config = _runtime_config(tmp_path)
+    workflow = ReleaseWorkflow(
+        config=config,
+        slack_gateway=_OrderedSlackGateway(),  # type: ignore[arg-type]
+        state_store=_NoopStateStore(WorkflowState()),
+        runtime_engine=_OrderedRuntime(),
+    )
+
+    workflow.tick(trigger_reason="event_trigger")
+
+    assert call_order.index("kickoff") < call_order.index("add_reaction")
+    assert call_order.index("kickoff") < call_order.index("pending_events_count")
 
 
 def test_release_workflow_keeps_paused_state_without_approval_event(tmp_path: Path) -> None:
@@ -173,6 +234,132 @@ def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch,
     assert decision.audit_reason.startswith("runtime_error:")
 
 
+def test_kickoff_routes_paused_message_to_agent_for_override_with_mention(monkeypatch, tmp_path: Path) -> None:
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
+    coordinator = RuntimeCoordinator(
+        policy=_policy(),
+        slack_gateway=gateway,
+        memory_db_path=str(tmp_path / "memory.db"),
+    )
+    captured_events: list[dict[str, object]] = []
+
+    def _agent_override_decision(*, payload: dict[str, object]) -> dict[str, object]:
+        captured_events.extend(payload.get("events", []))  # type: ignore[arg-type]
+        return {
+            "next_step": "IDLE",
+            "next_state": {
+                "active_release": None,
+                "previous_release_version": "5.105.0",
+                "checkpoints": [],
+            },
+            "tool_calls": [],
+            "audit_reason": "manual_status_override:5.105.0->IDLE",
+            "flow_lifecycle": "completed",
+        }
+
+    monkeypatch.setattr(coordinator, "_execute_runtime", _agent_override_decision)
+
+    initial_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.105.0",
+            step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
+            slack_channel_id="C_RELEASE",
+        ),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation",
+    )
+    decision = coordinator.kickoff(
+        state=initial_state,
+        events=[
+            SlackEvent(
+                event_id="evt-1",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="<@U0AHX8XBZBJ> Переведи 5.105.0 в IDLE",
+                message_ts="123.456",
+            )
+        ],
+        config=_config(),
+    )
+
+    assert len(captured_events) == 1
+    assert captured_events[0]["text"] == "<@U0AHX8XBZBJ> Переведи 5.105.0 в IDLE"
+    assert decision.next_step == ReleaseStep.IDLE
+    assert decision.next_state.active_release is None
+    assert decision.next_state.previous_release_version == "5.105.0"
+    assert decision.flow_lifecycle == "completed"
+    assert decision.audit_reason == "manual_status_override:5.105.0->IDLE"
+
+
+def test_kickoff_routes_non_message_paused_events_to_agent(monkeypatch, tmp_path: Path) -> None:
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
+    coordinator = RuntimeCoordinator(
+        policy=_policy(),
+        slack_gateway=gateway,
+        memory_db_path=str(tmp_path / "memory.db"),
+    )
+    called = {"value": False}
+
+    def _agent_decision(*, payload: dict[str, object]) -> dict[str, object]:
+        called["value"] = True
+        events = payload.get("events", [])
+        assert isinstance(events, list)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "approval_confirmed"
+        return {
+            "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
+            "next_state": {
+                "active_release": {
+                    "release_version": "5.105.0",
+                    "step": "WAIT_MANUAL_RELEASE_CONFIRMATION",
+                    "slack_channel_id": "C_RELEASE",
+                    "message_ts": {},
+                    "thread_ts": {},
+                    "readiness_map": {},
+                },
+                "flow_execution_id": "flow-1",
+                "flow_paused_at": "2026-01-01T00:00:00+00:00",
+                "pause_reason": "awaiting_confirmation",
+                "checkpoints": [],
+            },
+            "tool_calls": [],
+            "audit_reason": "agent_transition_after_approval_event",
+            "flow_lifecycle": "paused",
+        }
+
+    monkeypatch.setattr(coordinator, "_execute_runtime", _agent_decision)
+
+    initial_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.105.0",
+            step=ReleaseStep.WAIT_START_APPROVAL,
+            slack_channel_id="C_RELEASE",
+        ),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation",
+    )
+    decision = coordinator.kickoff(
+        state=initial_state,
+        events=[
+            SlackEvent(
+                event_id="evt-2",
+                event_type="approval_confirmed",
+                channel_id="C_RELEASE",
+                text="approve",
+                message_ts="123.457",
+            )
+        ],
+        config=_config(),
+    )
+
+    assert called["value"] is True
+    assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.flow_lifecycle == "paused"
+    assert decision.audit_reason == "agent_transition_after_approval_event"
+
+
 def test_normalize_readiness_message_adds_mentions_and_keeps_reminder_bold() -> None:
     source = (
         "Релиз 5.104.0\n\n"
@@ -194,7 +381,7 @@ def test_normalize_readiness_message_adds_mentions_and_keeps_reminder_bold() -> 
 
     assert ":hourglass_flowing_sand: Growth @Мурат Камалов" in normalized
     assert ":hourglass_flowing_sand: Core @Антон Давыдов" in normalized
-    assert "**Важное напоминание** – все задачи" in normalized
+    assert "*Важное напоминание* – все задачи" in normalized
 
 
 def test_normalize_readiness_message_preserves_existing_slack_id_mentions() -> None:
@@ -203,7 +390,7 @@ def test_normalize_readiness_message_preserves_existing_slack_id_mentions() -> N
         "Статус готовности к срезу:\n"
         ":hourglass_flowing_sand: Growth Someone\n\n"
         "Напишите в треде по готовности своей части.\n"
-        "**Важное напоминание** – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "*Важное напоминание* – все задачи, не влитые в ветку RC до 15:00 МСК "
         "едут в релиз только после одобрения QA"
     )
     normalized = _normalize_readiness_message_text(
@@ -213,3 +400,21 @@ def test_normalize_readiness_message_preserves_existing_slack_id_mentions() -> N
     )
 
     assert ":hourglass_flowing_sand: Growth <@U12345>" in normalized
+
+
+def test_normalize_readiness_message_converts_channel_like_mentions() -> None:
+    source = (
+        "Релиз 5.104.0\n\n"
+        "Статус готовности к срезу:\n"
+        ":hourglass_flowing_sand: Growth Someone\n\n"
+        "Напишите в треде по готовности своей части.\n"
+        "Важное напоминание – все задачи, не влитые в ветку RC до 15:00 МСК "
+        "едут в релиз только после одобрения QA"
+    )
+    normalized = _normalize_readiness_message_text(
+        text=source,
+        release_version="5.104.0",
+        readiness_owners={"Growth": "<@D09TKUA7R9U>"},
+    )
+
+    assert ":hourglass_flowing_sand: Growth <#D09TKUA7R9U>" in normalized
