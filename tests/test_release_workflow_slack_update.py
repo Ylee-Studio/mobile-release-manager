@@ -266,11 +266,11 @@ def test_readiness_confirmation_sequentially_updates_only_target_lines(tmp_path:
 def test_rc_branch_notice_is_sent_to_channel_not_thread(tmp_path: Path) -> None:
     workflow, gateway = _build_workflow(tmp_path)
     decision = RuntimeDecision(
-        next_step=ReleaseStep.READY_FOR_BRANCH_CUT,
+        next_step=ReleaseStep.WAIT_BRANCH_CUT,
         next_state=WorkflowState(
             active_release=ReleaseContext(
                 release_version="5.105.0",
-                step=ReleaseStep.READY_FOR_BRANCH_CUT,
+                step=ReleaseStep.WAIT_BRANCH_CUT,
                 slack_channel_id="C_RELEASE",
                 thread_ts={
                     "manual_release_confirmation": "111.200",

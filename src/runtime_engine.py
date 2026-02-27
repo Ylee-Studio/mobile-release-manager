@@ -21,6 +21,7 @@ from .policies import PolicyConfig
 from .runtime_contracts import AgentDecisionPayload, ToolCallPayload
 from .tasks import build_flow_task
 from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
+from .tools.github_tools import GitHubActionInput
 from .tools.slack_tools import SlackApproveInput, SlackEvent, SlackGateway, SlackMessageInput, SlackUpdateInput
 from .workflow_state import (
     ReleaseStep,
@@ -145,6 +146,7 @@ class RuntimeCoordinator:
             "slack_message": SlackMessageInput,
             "slack_approve": SlackApproveInput,
             "slack_update": SlackUpdateInput,
+            "github_action": GitHubActionInput,
         }
         self._llm_runtime = DirectLLMRuntime(policy=policy)
         self._agent = build_flow_agent(policy)
@@ -655,6 +657,12 @@ def _normalize_active_release_container(
         previous_thread_ts = dict(previous_active.thread_ts) if previous_active else {}
         previous_readiness = dict(previous_active.readiness_map) if previous_active else {}
         previous_channel_id = previous_active.slack_channel_id if previous_active else None
+        previous_github_run_id = previous_active.github_action_run_id if previous_active else None
+        previous_github_status = previous_active.github_action_status if previous_active else None
+        previous_github_conclusion = previous_active.github_action_conclusion if previous_active else None
+        previous_github_last_polled_at = (
+            previous_active.github_action_last_polled_at if previous_active else None
+        )
         normalized["active_release"] = {
             "release_version": release_version,
             "step": next_step.value,
@@ -662,6 +670,10 @@ def _normalize_active_release_container(
             "thread_ts": previous_thread_ts,
             "readiness_map": previous_readiness,
             "slack_channel_id": previous_channel_id,
+            "github_action_run_id": previous_github_run_id,
+            "github_action_status": previous_github_status,
+            "github_action_conclusion": previous_github_conclusion,
+            "github_action_last_polled_at": previous_github_last_polled_at,
         }
 
     return normalized

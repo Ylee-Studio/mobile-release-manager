@@ -10,7 +10,7 @@ workflow:
     AutoCut: "<@U06U3KAELCU>" # Кирилл Горбачёнок
     AI Tools: "<@U07MT1SK3K2>" # Макс Адамян
     Activation: "<@U09ND68KZ9D>" # Евгений Кулинич
-    Влит релиз Движка в dev: "<@U043XSCKZ0V>" # Павел Кряжевских
+    Влит релиз Движка в dev: "<@U043XSCKZ0V>, <@U044DSV5H1P>" # Павел Кряжевских, Антон Чунарев
     Влит релиз FeaturesKit в dev: "<@U06U3KAELCU>" # Кирилл Горбачёнок
 
 slack:
@@ -24,6 +24,13 @@ jira:
     - "VALUE"
     - "AC"
     - "IACTEAM"
+
+github:
+  repo: "${GITHUB_REPO}"
+  token: "${GITHUB_TOKEN}"
+  workflow_file: "create_release_branch.yml"
+  ref: "main"
+  poll_interval_seconds: 30
 
 retry:
   max_attempts: 3

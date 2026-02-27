@@ -18,7 +18,8 @@ class ReleaseStep(str, Enum):
     WAIT_MANUAL_RELEASE_CONFIRMATION = "WAIT_MANUAL_RELEASE_CONFIRMATION"
     WAIT_MEETING_CONFIRMATION = "WAIT_MEETING_CONFIRMATION"
     WAIT_READINESS_CONFIRMATIONS = "WAIT_READINESS_CONFIRMATIONS"
-    READY_FOR_BRANCH_CUT = "READY_FOR_BRANCH_CUT"
+    WAIT_BRANCH_CUT = "WAIT_BRANCH_CUT"
+    WAIT_BRANCH_CUT_APPROVAL = "WAIT_BRANCH_CUT_APPROVAL"
 
 
 # Shared aliases for external status values (LLM payloads/manual overrides).
@@ -90,6 +91,10 @@ class ReleaseContext(BaseModel):
     message_ts: dict[str, str] = Field(default_factory=dict)
     thread_ts: dict[str, str] = Field(default_factory=dict)
     readiness_map: dict[str, bool] = Field(default_factory=dict)
+    github_action_run_id: int | None = None
+    github_action_status: str | None = None
+    github_action_conclusion: str | None = None
+    github_action_last_polled_at: str | None = None
 
     def set_step(self, step: ReleaseStep) -> None:
         self.step = step
@@ -165,6 +170,10 @@ class WorkflowState(BaseModel):
                     message_ts=message_ts,
                     thread_ts=thread_ts,
                     readiness_map=readiness_map,
+                    github_action_run_id=active_raw.get("github_action_run_id"),
+                    github_action_status=active_raw.get("github_action_status"),
+                    github_action_conclusion=active_raw.get("github_action_conclusion"),
+                    github_action_last_polled_at=active_raw.get("github_action_last_polled_at"),
                 )
 
         return cls(

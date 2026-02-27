@@ -21,9 +21,10 @@ from .policies import PolicyConfig
 from .release_workflow import ReleaseWorkflow
 from .state_store import WorkflowStateStore
 from .slack_ingress import build_ingress_config, run_slack_ingress
+from .tools.github_tools import GitHubGateway
 from .tools.slack_tools import SlackGateway
 
-app = typer.Typer(help="Coordinate release train workflow up to READY_FOR_BRANCH_CUT.")
+app = typer.Typer(help="Coordinate release train workflow up to WAIT_BRANCH_CUT_APPROVAL.")
 console = Console()
 
 
@@ -48,11 +49,16 @@ def _build_workflow() -> ReleaseWorkflow:
         slack_gateway=slack_gateway,
         memory_db_path=runtime.memory_db_path,
     )
+    github_gateway = GitHubGateway(
+        token=runtime.github_token,
+        repo=runtime.github_repo,
+    )
     workflow = ReleaseWorkflow(
         config=runtime,
         slack_gateway=slack_gateway,
         state_store=state_store,
         runtime_engine=runtime_engine,
+        github_gateway=github_gateway,
     )
     return workflow
 

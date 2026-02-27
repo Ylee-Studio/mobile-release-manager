@@ -14,6 +14,7 @@ from urllib.parse import quote
 from .runtime_engine import RuntimeCoordinator, RuntimeDecision
 from .state_store import WorkflowStateStore
 from .tool_calling import ToolCallValidationError, validate_and_normalize_tool_calls
+from .tools.github_tools import GitHubActionInput, GitHubGateway
 from .tools.slack_tools import (
     SlackApproveInput,
     SlackGateway,
@@ -37,6 +38,11 @@ class RuntimeConfig:
     memory_db_path: str
     audit_log_path: str
     slack_events_path: str
+    github_repo: str = "Ylee-Studio/instories-ios"
+    github_token: str = ""
+    github_workflow_file: str = "create_release_branch.yml"
+    github_ref: str = "main"
+    github_poll_interval_seconds: int = 30
 
 
 WORKFLOW_STATE_KEY = "release_workflow_state"
@@ -57,6 +63,7 @@ class ReleaseWorkflow:
         memory: Any | None = None,
         runtime_engine: RuntimeCoordinator | Any | None = None,
         legacy_runtime: RuntimeCoordinator | Any | None = None,
+        github_gateway: GitHubGateway | None = None,
     ):
         self.config = config
         self.state_store = state_store or _build_legacy_state_store(memory=memory, fallback_path=config.memory_db_path)
@@ -68,6 +75,10 @@ class ReleaseWorkflow:
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("release_workflow")
         self._state = self.state_store.load()
+        self.github_gateway = github_gateway or GitHubGateway(
+            token=config.github_token,
+            repo=config.github_repo,
+        )
 
     def tick(
         self,
@@ -97,6 +108,7 @@ class ReleaseWorkflow:
                     "slack_message": SlackMessageInput,
                     "slack_approve": SlackApproveInput,
                     "slack_update": SlackUpdateInput,
+                    "github_action": GitHubActionInput,
                 },
             )
         except ToolCallValidationError as exc:
@@ -109,6 +121,7 @@ class ReleaseWorkflow:
                 tool_calls=[],
             )
         self._execute_tool_calls(decision=decision, events=events)
+        self._poll_branch_cut_action_if_due(decision=decision)
         next_state = decision.next_state
         self.state_store.save(state=next_state, reason=decision.audit_reason)
         self._state = WorkflowState.from_dict(next_state.to_dict())
@@ -234,6 +247,44 @@ class ReleaseWorkflow:
                 self._execute_slack_message(call=call, decision=decision, events=events)
             if tool_name == "slack_update":
                 self._execute_slack_update(call=call, decision=decision, events=events)
+            if tool_name == "github_action":
+                self._execute_github_action(call=call, decision=decision)
+
+    def _execute_github_action(
+        self,
+        *,
+        call: dict[str, Any],
+        decision: RuntimeDecision,
+    ) -> None:
+        release = decision.next_state.active_release
+        if release is None:
+            return
+        if release.github_action_run_id:
+            # Prevent duplicate dispatch across repeated ticks.
+            return
+        args_raw = call.get("args", {})
+        args = args_raw if isinstance(args_raw, dict) else {}
+        workflow_file = str(args.get("workflow_file") or self.config.github_workflow_file).strip()
+        if not workflow_file:
+            return
+        ref = str(args.get("ref") or self.config.github_ref).strip() or "main"
+        inputs_raw = args.get("inputs", {})
+        inputs = inputs_raw if isinstance(inputs_raw, dict) else {}
+        if "version" not in inputs:
+            inputs["version"] = release.release_version
+        try:
+            run = self.github_gateway.trigger_workflow(
+                workflow_file=workflow_file,
+                ref=ref,
+                inputs=inputs,
+            )
+        except Exception as exc:  # pragma: no cover - runtime safety
+            self.logger.exception("github_action failed for release=%s: %s", release.release_version, exc)
+            return
+        release.github_action_run_id = run.run_id
+        release.github_action_status = run.status
+        release.github_action_conclusion = run.conclusion
+        release.github_action_last_polled_at = datetime.now(timezone.utc).isoformat()
 
     def _execute_slack_approve(
         self,
@@ -251,9 +302,10 @@ class ReleaseWorkflow:
             default_approve_label = "Релиз создан"
         elif decision.next_step == ReleaseStep.WAIT_MEETING_CONFIRMATION:
             message_key = "meeting_confirmation"
+            release_issues_url = _readiness_issues_url(release.release_version)
             default_text = (
-                f"Подтвердите, что встреча фиксации релиза {release.release_version} проведена "
-                "и можно переходить к сбору readiness."
+                "Подтвердите, что встреча фиксации "
+                f"<{release_issues_url}|релиза> уже прошла."
             )
             default_approve_label = "Митинг проведен"
         else:
@@ -545,6 +597,35 @@ class ReleaseWorkflow:
                 "at": datetime.now(timezone.utc).isoformat(),
             }
         )
+
+    def _poll_branch_cut_action_if_due(self, *, decision: RuntimeDecision) -> None:
+        release = decision.next_state.active_release
+        if release is None:
+            return
+        if decision.next_state.step != ReleaseStep.WAIT_BRANCH_CUT:
+            return
+        run_id = release.github_action_run_id
+        if not run_id:
+            return
+        now = datetime.now(timezone.utc)
+        last_polled = _parse_iso_datetime(release.github_action_last_polled_at)
+        if last_polled is not None:
+            elapsed = (now - last_polled).total_seconds()
+            if elapsed < max(1, int(self.config.github_poll_interval_seconds)):
+                return
+        try:
+            run = self.github_gateway.get_workflow_run(run_id=run_id)
+        except Exception as exc:  # pragma: no cover - runtime safety
+            self.logger.warning("github_action poll failed run_id=%s: %s", run_id, exc)
+            return
+        release.github_action_status = run.status
+        release.github_action_conclusion = run.conclusion
+        release.github_action_last_polled_at = now.isoformat()
+        if run.status == "completed":
+            release.set_step(ReleaseStep.WAIT_BRANCH_CUT_APPROVAL)
+            decision.next_step = ReleaseStep.WAIT_BRANCH_CUT_APPROVAL
+            decision.flow_lifecycle = "paused"
+            decision.audit_reason = f"github_action_completed:{run.conclusion or 'unknown'}"
 
 
 class _LegacyMemoryStateStore:
@@ -866,5 +947,19 @@ def _audit_field(audit_reason: str, key: str) -> str | None:
             continue
         return normalized.split(":", 1)[-1].strip() or None
     return None
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 

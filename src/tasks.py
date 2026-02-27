@@ -6,7 +6,7 @@ from .runtime_contracts import AgentDecisionPayload
 # Schema definitions for LLM context
 _RELEASE_STEP_VALUES = (
     "IDLE|WAIT_START_APPROVAL|WAIT_MANUAL_RELEASE_CONFIRMATION|"
-    "WAIT_MEETING_CONFIRMATION|WAIT_READINESS_CONFIRMATIONS|READY_FOR_BRANCH_CUT"
+    "WAIT_MEETING_CONFIRMATION|WAIT_READINESS_CONFIRMATIONS|WAIT_BRANCH_CUT|WAIT_BRANCH_CUT_APPROVAL"
 )
 
 _TOOL_SCHEMA_DEFS = """
@@ -19,6 +19,9 @@ Available tools:
 
 3. slack_update - Update existing Slack message
    Args: {channel_id: string, message_ts: string, text: string}
+
+4. github_action - Trigger GitHub Actions workflow
+   Args: {workflow_file: string, ref: string, inputs?: object}
 
 Tool call format:
 {"tool": "slack_message", "reason": "why this call is made", "args": {...}}
@@ -64,10 +67,8 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- If message starts with Slack mention(s) like '<@U...>', ignore mention prefix and parse remaining text\n"
             "Allowed STATUS values:\n"
             "- Any ReleaseStep value: IDLE, WAIT_START_APPROVAL, WAIT_MANUAL_RELEASE_CONFIRMATION, "
-            "WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, READY_FOR_BRANCH_CUT\n"
-            "- Aliases: AWAITING_START_APPROVAL, WAITING_START_APPROVAL, RELEASE_MANAGER_ACTIVE, "
-            "RELEASE_MANAGER_CREATED, AWAITING_MANUAL_RELEASE_CONFIRMATION, JIRA_RELEASE_READY, "
-            "JIRA_RELEASE_CREATED, AWAITING_MEETING_CONFIRMATION, AWAITING_READINESS_CONFIRMATIONS\n"
+            "WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, WAIT_BRANCH_CUT, "
+            "WAIT_BRANCH_CUT_APPROVAL\n"
             "Actions:\n"
             "- Parse release version from message text (must match X.Y.Z)\n"
             "- Parse STATUS and convert to next_step\n"
@@ -93,7 +94,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- Add slack_update for approved start-approval message.\n"
             '  Args: {channel_id, message_ts, text: "Подтверждено :white_check_mark:"} (runtime appends confirmation to original message text from event metadata)\n'
             "- Add exactly ONE slack_approve tool call for Jira release creation:\n"
-            '  Args: {channel_id, text: "Подтвердите создание релиза {version} в JIRA. <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>", approve_label: "Подтвердить"}\n'
+            '  Args: {channel_id, text: "Подтвердите создание релиза {version} в <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>.", approve_label: "Подтвердить"}\n'
             "- Save message_ts from this approval message to active_release.message_ts['manual_release_confirmation']\n"
             "- Return flow_lifecycle='paused' (waiting for human)\n\n"
             "### 3. On approval_confirmed event (button clicked)\n"
@@ -108,7 +109,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "Actions:\n"
             "- Set next_step = WAIT_MEETING_CONFIRMATION\n"
             "- Add slack_approve tool call:\n"
-            '  Args: {channel_id, text: "Подтвердите, что встреча фиксации релиза уже прошла", approve_label: "Встреча прошла"}\n'
+            '  Args: {channel_id, text: "Подтвердите, что встреча фиксации <https://instories.atlassian.net/issues/?jql=fixVersion={version}|релиза> уже прошла.", approve_label: "Встреча прошла"}\n'
             "- Return flow_lifecycle='paused'\n\n"
             "### 5. WAIT_MEETING_CONFIRMATION → WAIT_READINESS_CONFIRMATIONS\n"
             "Trigger: approval_confirmed received in WAIT_MEETING_CONFIRMATION\n"
@@ -139,16 +140,23 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "  * matched points -> ':white_check_mark:'\n"
             "  * unmatched points remain ':hourglass_flowing_sand:'\n"
             "- If ALL points from config.readiness_owners are true:\n"
-            "  * Set next_step = READY_FOR_BRANCH_CUT\n"
+            "  * Set next_step = WAIT_BRANCH_CUT\n"
+            "  * Add exactly ONE github_action tool call to trigger release branch workflow:\n"
+            '    Args: {workflow_file: "create_release_branch.yml", ref: "main", inputs: {"version": "{version}"}}\n'
             '  * Add exactly ONE slack_message tool call with text: "Можно выделять RC ветку" (в канал, без thread_ts)\n'
-            "  * Return flow_lifecycle='running'\n"
+            "  * Return flow_lifecycle='paused'\n"
             "- Otherwise stay in WAIT_READINESS_CONFIRMATIONS with flow_lifecycle='paused'\n\n"
-            "### 7. READY_FOR_BRANCH_CUT\n"
-            "Trigger: All readiness points confirmed\n"
+            "### 7. WAIT_BRANCH_CUT\n"
+            "Trigger: release branch action has been started and is being polled by runtime\n"
             "Actions:\n"
-            "- Set flow_lifecycle='completed'\n"
-            "- Clear flow_execution_id\n"
-            "- Keep active_release for reference (don't delete)\n\n"
+            "- Keep current step while action status is queued/in_progress\n"
+            "- Return no tool_calls by default\n"
+            "- Return flow_lifecycle='paused'\n\n"
+            "### 8. WAIT_BRANCH_CUT_APPROVAL\n"
+            "Trigger: runtime detected branch-cut action completed\n"
+            "Actions:\n"
+            "- Hold state for downstream manual approval\n"
+            "- Return flow_lifecycle='paused'\n\n"
             "## Output Format\n\n"
             "Return valid JSON matching AgentDecision schema. Example:\n\n"
             '{\n'
@@ -170,7 +178,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             '      "reason": "Request release creation confirmation",\n'
             '      "args": {\n'
             '        "channel_id": "C123",\n'
-            '        "text": "Подтвердите создание релиза 5.105.0 в JIRA. <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>",\n'
+            '        "text": "Подтвердите создание релиза 5.105.0 в <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>",\n'
             '        "approve_label": "Подтвердить"\n'
             '      }\n'
             '    }\n'

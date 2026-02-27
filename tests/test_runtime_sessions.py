@@ -146,7 +146,7 @@ def test_resolve_tool_calls_prefers_payload_list_over_partial_native(monkeypatch
                 "reason": "request meeting confirmation",
                 "args": {
                     "channel_id": "C0AGLKF6KHD",
-                    "text": "Подтвердите, что встреча фиксации релиза уже прошла.",
+                    "text": "Подтвердите, что встреча фиксации <https://instories.atlassian.net/issues/?jql=fixVersion%3D5.104.0|релиза> уже прошла.",
                     "approve_label": "Подтвердить",
                 },
             },
