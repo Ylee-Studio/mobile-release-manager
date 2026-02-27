@@ -21,7 +21,7 @@ Available tools:
    Args: {channel_id: string, message_ts: string, text: string}
 
 4. github_action - Trigger GitHub Actions workflow
-   Args: {workflow_file: string, ref: string, inputs?: object}
+   Args: {workflow_file: string, ref?: string, inputs?: object}
 
 Tool call format:
 {"tool": "slack_message", "reason": "why this call is made", "args": {...}}
@@ -30,10 +30,10 @@ Tool call format:
 _RESPONSE_SCHEMA_DEFS = f"""
 Response schema (AgentDecision):
 - next_step: ReleaseStep enum value, one of: {_RELEASE_STEP_VALUES}
-- next_state: dict with active_release, flow_execution_id, checkpoints, etc.
-- state_patch: optional partial updates to merge into next_state
+- next_state: optional full WorkflowState dict (use only when full replace is required)
+- state_patch: preferred field for minimal partial updates
 - tool_calls: list of tool call objects
-- audit_reason: string explaining the decision
+- audit_reason: short reason code (1-4 words)
 - flow_lifecycle: "running" | "paused" | "completed"
 """
 
@@ -58,6 +58,13 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "Runtime contract:\n"
             "- Runtime is agent-first and does not apply deterministic business transitions.\n"
             "- If runtime cannot parse/validate your output, it falls back to safe no-op.\n\n"
+            "## Response Size Rules (high priority)\n"
+            "- Return JSON only, no markdown, no explanations, no repeated input context.\n"
+            "- Prefer minimal payload: keep next_state={} and write only changed fields in state_patch.\n"
+            "- Use next_state only when a full replacement is strictly needed.\n"
+            "- Keep audit_reason short and stable (1-4 words, snake_case preferred).\n"
+            "- Keep tool_calls[].reason short (1-3 words) or empty string.\n"
+            "- Do not include optional fields when they are unchanged.\n\n"
             f"{_RESPONSE_SCHEMA_DEFS}\n\n"
             f"{_TOOL_SCHEMA_DEFS}\n\n"
             "## Workflow State Transitions\n\n"
@@ -142,7 +149,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- If ALL points from config.readiness_owners are true:\n"
             "  * Set next_step = WAIT_BRANCH_CUT\n"
             "  * Add exactly ONE github_action tool call to trigger release branch workflow:\n"
-            '    Args: {workflow_file: "create_release_branch.yml", ref: "main", inputs: {"version": "{version}"}}\n'
+            '    Args: {workflow_file: "create_release_branch.yml", inputs: {"version": "{version}"}}\n'
             '  * Add exactly ONE slack_message tool call with text: "Можно выделять RC ветку" (в канал, без thread_ts)\n'
             "  * Return flow_lifecycle='paused'\n"
             "- Otherwise stay in WAIT_READINESS_CONFIRMATIONS with flow_lifecycle='paused'\n\n"
@@ -158,24 +165,19 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- Hold state for downstream manual approval\n"
             "- Return flow_lifecycle='paused'\n\n"
             "## Output Format\n\n"
-            "Return valid JSON matching AgentDecision schema. Example:\n\n"
+            "Return compact valid JSON matching AgentDecision schema. Example:\n\n"
             '{\n'
             '  "next_step": "WAIT_MANUAL_RELEASE_CONFIRMATION",\n'
-            '  "next_state": {\n'
+            '  "next_state": {},\n'
+            '  "state_patch": {\n'
             '    "active_release": {\n'
-            '      "release_version": "5.105.0",\n'
-            '      "step": "WAIT_MANUAL_RELEASE_CONFIRMATION",\n'
-            '      "readiness_map": {},\n'
-            '      "message_ts": {},\n'
-            '      "thread_ts": {}\n'
+            '      "step": "WAIT_MANUAL_RELEASE_CONFIRMATION"\n'
+            '    }\n'
             '    },\n'
-            '    "flow_execution_id": "uuid-here",\n'
-            '    "flow_paused_at": "2026-02-27T16:00:00+00:00"\n'
-            '  },\n'
             '  "tool_calls": [\n'
             '    {\n'
             '      "tool": "slack_approve",\n'
-            '      "reason": "Request release creation confirmation",\n'
+            '      "reason": "request_approval",\n'
             '      "args": {\n'
             '        "channel_id": "C123",\n'
             '        "text": "Подтвердите создание релиза 5.105.0 в <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>",\n'
@@ -183,12 +185,12 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             '      }\n'
             '    }\n'
             '  ],\n'
-            '  "audit_reason": "created_release_request",\n'
+            '  "audit_reason": "request_release_confirmation",\n'
             '  "flow_lifecycle": "paused"\n'
             '}\n\n'
             "## Important Notes\n\n"
             "- Always validate step transitions are allowed\n"
-            "- Use next_state for complete state, state_patch only for partial updates\n"
+            "- Prefer state_patch for minimal updates; use next_state only for full replacement\n"
             "- Include all required tool fields in args\n"
             "- Never use 'functions.' prefix in tool names\n"
             "- flow_lifecycle='paused' requires flow_execution_id to be set\n"

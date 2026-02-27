@@ -41,7 +41,7 @@ class RuntimeConfig:
     github_repo: str = "Ylee-Studio/instories-ios"
     github_token: str = ""
     github_workflow_file: str = "create_release_branch.yml"
-    github_ref: str = "main"
+    github_ref: str = "dev"
     github_poll_interval_seconds: int = 30
 
 
@@ -267,7 +267,7 @@ class ReleaseWorkflow:
         workflow_file = str(args.get("workflow_file") or self.config.github_workflow_file).strip()
         if not workflow_file:
             return
-        ref = str(args.get("ref") or self.config.github_ref).strip() or "main"
+        ref = str(args.get("ref") or self.config.github_ref).strip() or "dev"
         inputs_raw = args.get("inputs", {})
         inputs = inputs_raw if isinstance(inputs_raw, dict) else {}
         if "version" not in inputs:

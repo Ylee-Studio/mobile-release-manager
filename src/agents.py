@@ -20,17 +20,21 @@ def build_flow_agent(policies: PolicyConfig) -> dict[str, object]:
             "1. Analyze current workflow state and incoming Slack events\n"
             "2. Decide on the next workflow step based on business rules\n"
             "3. Generate appropriate tool calls (slack_message, slack_approve, slack_update, github_action)\n"
-            "4. Return structured decision with next_step, next_state, tool_calls, audit_reason\n\n"
+            "4. Return compact structured decision with next_step, state_patch, tool_calls, audit_reason\n\n"
             "Operating model:\n"
             "- Agent decides business transitions; runtime only validates, executes tools, and persists state.\n"
             "- On runtime/validation failure, runtime falls back to safe no-op.\n\n"
             "Output format: Strict JSON matching AgentDecision schema:\n"
             '- next_step: one of IDLE|WAIT_START_APPROVAL|WAIT_MANUAL_RELEASE_CONFIRMATION|WAIT_MEETING_CONFIRMATION|WAIT_READINESS_CONFIRMATIONS|WAIT_BRANCH_CUT|WAIT_BRANCH_CUT_APPROVAL\n'
-            '- next_state: complete WorkflowState dict including active_release with readiness_map\n'
-            '- state_patch: optional partial state updates\n'
+            '- next_state: keep empty {} by default; use only for full state replacement\n'
+            '- state_patch: preferred field with only changed keys\n'
             '- tool_calls: list of {tool, reason, args} for slack tools\n'
-            '- audit_reason: short explanation of the decision\n'
+            '- audit_reason: short reason code (1-4 words)\n'
             '- flow_lifecycle: "running" | "paused" | "completed"\n\n'
+            "Response size rules:\n"
+            '- Return JSON only. No markdown, no prose, no input restatement.\n'
+            '- Keep payload minimal and omit unchanged optional fields.\n'
+            '- Keep tool reason brief (1-3 words) or empty string.\n\n'
             "Tool calling rules:\n"
             '- Use canonical tool names: slack_message, slack_approve, slack_update\n'
             '- Never use "functions." prefix in tool names\n'

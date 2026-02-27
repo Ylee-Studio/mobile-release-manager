@@ -71,7 +71,7 @@ def _config(tmp_path: Path) -> RuntimeConfig:
         github_repo="Ylee-Studio/instories-ios",
         github_token="test-token",
         github_workflow_file="create_release_branch.yml",
-        github_ref="main",
+        github_ref="dev",
         github_poll_interval_seconds=30,
     )
 
@@ -97,7 +97,7 @@ def test_github_action_dispatch_sets_run_context(tmp_path: Path) -> None:
                     "reason": "dispatch branch cut workflow",
                     "args": {
                         "workflow_file": "create_release_branch.yml",
-                        "ref": "main",
+                        "ref": "dev",
                         "inputs": {"version": "5.105.0"},
                     },
                 }

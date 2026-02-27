@@ -41,17 +41,30 @@ class GitHubGateway:
         workflow = str(workflow_file or "").strip()
         if not workflow:
             raise RuntimeError("github workflow_file must be non-empty")
+        requested_ref = str(ref or "").strip() or self._default_branch() or "dev"
         payload = {
-            "ref": str(ref or "").strip() or "main",
+            "ref": requested_ref,
             "inputs": inputs or {},
         }
         before_latest_run_id = self._latest_run_id(workflow_file=workflow)
-        self._request_json(
-            method="POST",
-            path=f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches",
-            payload=payload,
-            expect_status=(204,),
-        )
+        try:
+            self._request_json(
+                method="POST",
+                path=f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches",
+                payload=payload,
+                expect_status=(204,),
+            )
+        except RuntimeError as exc:
+            fallback_ref = self._fallback_ref_for_missing_ref_error(exc=exc, requested_ref=requested_ref)
+            if not fallback_ref:
+                raise
+            payload["ref"] = fallback_ref
+            self._request_json(
+                method="POST",
+                path=f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches",
+                payload=payload,
+                expect_status=(204,),
+            )
         run = self._wait_for_new_run(workflow_file=workflow, previous_run_id=before_latest_run_id)
         if run is None:
             raise RuntimeError("workflow dispatched but run_id was not discovered")
@@ -145,6 +158,22 @@ class GitHubGateway:
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
 
+    def _default_branch(self) -> str:
+        data = self._request_json(
+            method="GET",
+            path=f"/repos/{self.repo}",
+            expect_status=(200,),
+        )
+        return str(data.get("default_branch") or "").strip()
+
+    def _fallback_ref_for_missing_ref_error(self, *, exc: RuntimeError, requested_ref: str) -> str:
+        if "No ref found for:" not in str(exc):
+            return ""
+        fallback = self._default_branch()
+        if not fallback or fallback == requested_ref:
+            return ""
+        return fallback
+
 
 def _run_from_payload(payload: dict[str, Any]) -> GitHubRun:
     run_id = int(payload.get("id") or 0)
@@ -158,13 +187,21 @@ def _run_from_payload(payload: dict[str, Any]) -> GitHubRun:
 
 class GitHubActionInput(BaseModel):
     workflow_file: str = Field(..., min_length=1, description="GitHub workflow file name.")
-    ref: str = Field(default="main", min_length=1, description="Git ref for workflow_dispatch.")
+    ref: str | None = Field(default=None, description="Git ref for workflow_dispatch (optional).")
     inputs: dict[str, Any] = Field(default_factory=dict, description="Optional workflow inputs.")
 
-    @field_validator("workflow_file", "ref")
+    @field_validator("workflow_file")
     @classmethod
     def _strip_required(cls, value: str) -> str:
         stripped = value.strip()
         if not stripped:
             raise ValueError("must be non-empty")
         return stripped
+
+    @field_validator("ref")
+    @classmethod
+    def _strip_optional_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None

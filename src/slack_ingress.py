@@ -310,6 +310,9 @@ def _should_ignore_message_event(raw_event: dict, event: dict) -> bool:
     bot_user_id = _extract_bot_user_id(raw_event)
     if bot_user_id and str(event.get("user", "")) == bot_user_id:
         return True
+    text = str(event.get("text", ""))
+    if not bot_user_id or f"<@{bot_user_id}" not in text:
+        return True
     return False
 
 

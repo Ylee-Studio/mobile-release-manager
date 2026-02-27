@@ -52,7 +52,7 @@ def load_runtime_config(config: dict) -> RuntimeConfig:
         fallback_env_var="GITHUB_TOKEN",
     )
     github_workflow_file = str(github.get("workflow_file", "create_release_branch.yml") or "").strip() or "create_release_branch.yml"
-    github_ref = str(github.get("ref", "main") or "").strip() or "main"
+    github_ref = str(github.get("ref", "dev") or "").strip() or "dev"
     github_poll_interval_seconds_raw = github.get("poll_interval_seconds", 30)
     try:
         github_poll_interval_seconds = int(github_poll_interval_seconds_raw)

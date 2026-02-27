@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .agents import build_flow_agent
@@ -106,8 +106,11 @@ class RuntimeDecision(BaseModel):
                 next_step=resolved_next_step,
                 current_state=current_state,
             )
-        if isinstance(next_state_raw, dict):
+        if isinstance(next_state_raw, dict) and next_state_raw:
             next_state = WorkflowState.from_dict(next_state_raw)
+            if isinstance(state_patch, dict) and state_patch:
+                # Apply patch on top of explicit next_state to support compact diffs.
+                next_state = _apply_state_patch(next_state, state_patch)
         elif isinstance(state_patch, dict) and state_patch:
             next_state = _apply_state_patch(current_state, state_patch)
         else:
@@ -346,6 +349,63 @@ class DirectLLMRuntime:
         self._agent_retries = 3
         self._agent = self._build_agent()
 
+    def _build_model_settings(self) -> OpenAIModelSettings | None:
+        """Build model settings from environment variables with safe fallbacks."""
+        logger = logging.getLogger("runtime_engine")
+        settings: OpenAIModelSettings = OpenAIModelSettings()
+
+        reasoning_effort_raw = os.getenv("OPENAI_REASONING_EFFORT", "").strip().lower()
+        if reasoning_effort_raw:
+            allowed_reasoning_effort = {"minimal", "low", "medium", "high"}
+            if reasoning_effort_raw in allowed_reasoning_effort:
+                settings["openai_reasoning_effort"] = reasoning_effort_raw
+            else:
+                logger.warning(
+                    "invalid OPENAI_REASONING_EFFORT=%s; allowed=minimal|low|medium|high; using provider default",
+                    reasoning_effort_raw,
+                )
+
+        max_tokens_raw = os.getenv("OPENAI_MAX_TOKENS", "").strip()
+        if max_tokens_raw:
+            try:
+                max_tokens = int(max_tokens_raw)
+                if max_tokens <= 0:
+                    raise ValueError("must be > 0")
+                settings["max_tokens"] = max_tokens
+            except ValueError:
+                logger.warning(
+                    "invalid OPENAI_MAX_TOKENS=%s; expected positive integer; using provider default",
+                    max_tokens_raw,
+                )
+
+        temperature_raw = os.getenv("OPENAI_TEMPERATURE", "").strip()
+        if temperature_raw:
+            try:
+                temperature = float(temperature_raw)
+                if temperature < 0:
+                    raise ValueError("must be >= 0")
+                settings["temperature"] = temperature
+            except ValueError:
+                logger.warning(
+                    "invalid OPENAI_TEMPERATURE=%s; expected float >= 0; using provider default",
+                    temperature_raw,
+                )
+
+        timeout_raw = os.getenv("OPENAI_TIMEOUT_SECONDS", "").strip()
+        if timeout_raw:
+            try:
+                timeout_seconds = float(timeout_raw)
+                if timeout_seconds <= 0:
+                    raise ValueError("must be > 0")
+                settings["timeout"] = timeout_seconds
+            except ValueError:
+                logger.warning(
+                    "invalid OPENAI_TIMEOUT_SECONDS=%s; expected float > 0; using provider default",
+                    timeout_raw,
+                )
+
+        return settings if settings else None
+
     def _build_agent(self) -> Agent:
         """Build Pydantic AI agent with structured output."""
         api_key = os.getenv("OPENAI_API_KEY")
@@ -396,17 +456,45 @@ class DirectLLMRuntime:
         prompt: str,
         model_name: str,
         trigger_reason: str,
-    ) -> Any:
+        trace_id: str,
+        model_settings: OpenAIModelSettings | None,
+        prompt_chars: int,
+        prompt_tokens_estimate: int,
+    ) -> tuple[Any, dict[str, int]]:
         """Run agent inside coroutine to log exact pre-await point."""
         logger = logging.getLogger("runtime_engine")
         started_at = time.perf_counter()
+        reasoning_effort = (
+            model_settings.get("openai_reasoning_effort")
+            if model_settings is not None
+            else None
+        )
+        max_tokens = model_settings.get("max_tokens") if model_settings is not None else None
+        temperature = model_settings.get("temperature") if model_settings is not None else None
+        timeout = model_settings.get("timeout") if model_settings is not None else None
         logger.info(
-            "openai_request_start model=%s trigger_reason=%s configured_retries=%s",
+            "openai_request_start trace_id=%s model=%s trigger_reason=%s configured_retries=%s reasoning_effort=%s max_tokens=%s temperature=%s timeout=%s",
+            trace_id,
             model_name,
             trigger_reason,
             self._agent_retries,
+            reasoning_effort,
+            max_tokens,
+            temperature,
+            timeout,
         )
-        result = await self._agent.run(prompt)
+        logger.info(
+            "openai_prompt_stats trace_id=%s model=%s trigger_reason=%s prompt_chars=%s prompt_tokens_estimate=%s",
+            trace_id,
+            model_name,
+            trigger_reason,
+            prompt_chars,
+            prompt_tokens_estimate,
+        )
+        model_wait_started_at = time.perf_counter()
+        result = await self._agent.run(prompt, model_settings=model_settings)
+        model_wait_ms = int((time.perf_counter() - model_wait_started_at) * 1000)
+        result_parse_started_at = time.perf_counter()
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
 
         all_messages_count = 0
@@ -427,12 +515,16 @@ class DirectLLMRuntime:
         except Exception:
             # Best-effort diagnostics only; never break runtime flow.
             pass
+        result_parse_ms = int((time.perf_counter() - result_parse_started_at) * 1000)
 
         logger.info(
-            "openai_request_done model=%s trigger_reason=%s elapsed_ms=%s model_requests=%s model_responses=%s retry_prompts=%s all_messages=%s",
+            "openai_request_done trace_id=%s model=%s trigger_reason=%s elapsed_ms=%s model_wait_ms=%s result_parse_ms=%s model_requests=%s model_responses=%s retry_prompts=%s all_messages=%s",
+            trace_id,
             model_name,
             trigger_reason,
             elapsed_ms,
+            model_wait_ms,
+            result_parse_ms,
             model_request_count,
             model_response_count,
             retry_prompt_count,
@@ -440,13 +532,17 @@ class DirectLLMRuntime:
         )
         if model_response_count > 1 or retry_prompt_count > 0:
             logger.warning(
-                "openai_request_retry_detected reason=structured_output_validation_or_retry model=%s trigger_reason=%s model_responses=%s retry_prompts=%s",
+                "openai_request_retry_detected trace_id=%s reason=structured_output_validation_or_retry model=%s trigger_reason=%s model_responses=%s retry_prompts=%s",
+                trace_id,
                 model_name,
                 trigger_reason,
                 model_response_count,
                 retry_prompt_count,
             )
-        return result
+        return result, {
+            "model_wait_ms": model_wait_ms,
+            "result_parse_ms": result_parse_ms,
+        }
 
     def _run_agent_sync(
         self,
@@ -461,39 +557,67 @@ class DirectLLMRuntime:
         import nest_asyncio
         nest_asyncio.apply()
 
+        trace_id = str(uuid.uuid4())
+        prompt_build_started_at = time.perf_counter()
         prompt = self._build_user_prompt(payload=payload, task=task)
+        prompt_build_ms = int((time.perf_counter() - prompt_build_started_at) * 1000)
         prompt_chars = len(prompt)
+        # Fast and cheap rough estimate for correlation in logs.
+        prompt_tokens_estimate = max(1, prompt_chars // 4)
         model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
         trigger_reason = str(payload.get("trigger_reason", "event_trigger"))
+        model_settings = self._build_model_settings()
         started_at = time.perf_counter()
+        event_loop_prepare_started_at = time.perf_counter()
+        event_loop_prepare_ms = 0
+        loop_mode = "unknown"
+        async_metrics = {"model_wait_ms": 0, "result_parse_ms": 0}
 
         # Get or create event loop and run async agent
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 # We're in an async context, use nest_asyncio
-                result = asyncio.run(
+                loop_mode = "asyncio_run_nested"
+                event_loop_prepare_ms = int((time.perf_counter() - event_loop_prepare_started_at) * 1000)
+                result, async_metrics = asyncio.run(
                     self._run_agent_async(
                         prompt=prompt,
                         model_name=model_name,
                         trigger_reason=trigger_reason,
+                        trace_id=trace_id,
+                        model_settings=model_settings,
+                        prompt_chars=prompt_chars,
+                        prompt_tokens_estimate=prompt_tokens_estimate,
                     )
                 )
             else:
-                result = loop.run_until_complete(
+                loop_mode = "run_until_complete"
+                event_loop_prepare_ms = int((time.perf_counter() - event_loop_prepare_started_at) * 1000)
+                result, async_metrics = loop.run_until_complete(
                     self._run_agent_async(
                         prompt=prompt,
                         model_name=model_name,
                         trigger_reason=trigger_reason,
+                        trace_id=trace_id,
+                        model_settings=model_settings,
+                        prompt_chars=prompt_chars,
+                        prompt_tokens_estimate=prompt_tokens_estimate,
                     )
                 )
         except RuntimeError:
             # No event loop, create one
-            result = asyncio.run(
+            loop_mode = "asyncio_run_new_loop"
+            event_loop_prepare_ms = int((time.perf_counter() - event_loop_prepare_started_at) * 1000)
+            result, async_metrics = asyncio.run(
                 self._run_agent_async(
                     prompt=prompt,
                     model_name=model_name,
                     trigger_reason=trigger_reason,
+                    trace_id=trace_id,
+                    model_settings=model_settings,
+                    prompt_chars=prompt_chars,
+                    prompt_tokens_estimate=prompt_tokens_estimate,
                 )
             )
 
@@ -510,7 +634,8 @@ class DirectLLMRuntime:
         requests = getattr(usage, "requests", None)
         usage_unavailable = usage is None
         logging.getLogger("runtime_engine").info(
-            "llm_usage model=%s trigger_reason=%s request_tokens=%s response_tokens=%s total_tokens=%s requests=%s llm_elapsed_ms=%s prompt_chars=%s usage_unavailable=%s",
+            "llm_usage trace_id=%s model=%s trigger_reason=%s request_tokens=%s response_tokens=%s total_tokens=%s requests=%s llm_elapsed_ms=%s prompt_build_ms=%s event_loop_prepare_ms=%s model_wait_ms=%s result_parse_ms=%s loop_mode=%s prompt_chars=%s prompt_tokens_estimate=%s usage_unavailable=%s",
+            trace_id,
             model_name,
             trigger_reason,
             request_tokens,
@@ -518,7 +643,13 @@ class DirectLLMRuntime:
             total_tokens,
             requests,
             llm_elapsed_ms,
+            prompt_build_ms,
+            event_loop_prepare_ms,
+            async_metrics.get("model_wait_ms", 0),
+            async_metrics.get("result_parse_ms", 0),
+            loop_mode,
             prompt_chars,
+            prompt_tokens_estimate,
             usage_unavailable,
         )
         return result.output
@@ -539,7 +670,7 @@ class DirectLLMRuntime:
             decision = RuntimeDecision.from_payload(
                 {
                     "next_step": agent_decision.next_step,
-                    "next_state": agent_decision.next_state or current_state.to_dict(),
+                    "next_state": agent_decision.next_state,
                     "state_patch": agent_decision.state_patch,
                     "tool_calls": tool_calls_dicts,
                     "audit_reason": agent_decision.audit_reason,

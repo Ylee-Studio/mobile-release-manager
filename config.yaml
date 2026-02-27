@@ -29,7 +29,7 @@ github:
   repo: "${GITHUB_REPO}"
   token: "${GITHUB_TOKEN}"
   workflow_file: "create_release_branch.yml"
-  ref: "main"
+  ref: "dev"
   poll_interval_seconds: 30
 
 retry:
