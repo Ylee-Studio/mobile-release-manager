@@ -22,7 +22,10 @@ from .tools.slack_tools import (
 )
 from .workflow_state import ReleaseStep, WorkflowState
 
-MANUAL_RELEASE_MESSAGE = "Подтвердите создание релиза {release_version} в JIRA."
+MANUAL_RELEASE_MESSAGE = (
+    "Подтвердите создание релиза {release_version} в JIRA. "
+    "<https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>"
+)
 
 @dataclass
 class RuntimeConfig:
@@ -78,6 +81,8 @@ class ReleaseWorkflow:
         trace_id = str(uuid.uuid4())
 
         self.logger.info("processing events: %s", events)
+        self.logger.info("adding processing reactions before runtime decision")
+        self._add_processing_reactions(events=events)
 
         decision = self.start_or_continue_release(
             state=state,
@@ -103,7 +108,6 @@ class ReleaseWorkflow:
                 actor=decision.actor,
                 tool_calls=[],
             )
-        self._add_processing_reactions(events=events)
         self._execute_tool_calls(decision=decision, events=events)
         next_state = decision.next_state
         self.state_store.save(state=next_state, reason=decision.audit_reason)
@@ -164,6 +168,12 @@ class ReleaseWorkflow:
                     channel_id=channel_id,
                     message_ts=message_ts,
                     emoji="eyes",
+                )
+                self.logger.info(
+                    "processing reaction added before runtime decision channel=%s ts=%s emoji=%s",
+                    channel_id,
+                    message_ts,
+                    "eyes",
                 )
             except Exception as exc:  # pragma: no cover - runtime safety
                 self.logger.warning(
@@ -406,8 +416,8 @@ class ReleaseWorkflow:
             self.logger.warning("skip slack_message: empty channel_id for release=%s", release_version)
             return
 
-        if release is not None and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
-            # Readiness announcement must be a top-level channel message.
+        if _must_be_channel_level_message(text=text, next_step=decision.next_step):
+            # Readiness checklist and RC-branch-ready notice must be top-level channel messages.
             thread_ts_value = None
         else:
             thread_ts = str(args.get("thread_ts") or "").strip()
@@ -500,7 +510,7 @@ class ReleaseWorkflow:
                 base_text=trigger_message_text or text,
                 suffix="Подтверждено :white_check_mark:",
             )
-        elif text and not text.endswith(":white_check_mark:"):
+        elif text and not text.endswith(":white_check_mark:") and not _is_readiness_checklist_message(text):
             text = f"{text} :white_check_mark:"
         if not text:
             self.logger.warning("skip slack_update: empty text for release=%s", release.release_version)
@@ -815,6 +825,19 @@ def _build_readiness_checklist_text(
         "*Важное напоминание* – все задачи, не влитые в ветку RC до 15:00 МСК "
         "едут в релиз только после одобрения QA"
     )
+
+
+def _is_readiness_checklist_message(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    return "Статус готовности к срезу:" in normalized
+
+
+def _must_be_channel_level_message(*, text: str, next_step: ReleaseStep) -> bool:
+    if next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
+        return True
+    return str(text or "").strip() == "Можно выделять RC ветку"
 
 
 def _readiness_item_from_audit_reason(audit_reason: str) -> str:

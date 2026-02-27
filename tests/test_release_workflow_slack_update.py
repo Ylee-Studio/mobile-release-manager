@@ -165,6 +165,23 @@ def test_slack_update_falls_back_to_args_text_when_trigger_message_missing(tmp_p
     assert gateway.updated_payloads[0]["text"] == "Базовый текст\n\nПодтверждено :white_check_mark:"
 
 
+def test_slack_update_does_not_append_confirmation_to_readiness_checklist(tmp_path: Path) -> None:
+    workflow, gateway = _build_workflow(tmp_path)
+    decision = _decision()
+    checklist_text = (
+        "Релиз 5.105.0\n\n"
+        "Статус готовности к срезу:\n"
+        ":white_check_mark: Growth @owner\n"
+        ":hourglass_flowing_sand: Core @owner-core\n\n"
+        "Напишите в треде по готовности своей части."
+    )
+    call = {"args": {"channel_id": "C_RELEASE", "message_ts": "111.222", "text": checklist_text}}
+
+    workflow._execute_slack_update(call=call, decision=decision, events=[])  # noqa: SLF001
+
+    assert gateway.updated_payloads[0]["text"] == checklist_text
+
+
 def test_readiness_confirmation_updates_original_checklist_without_new_message(tmp_path: Path) -> None:
     workflow, gateway = _build_workflow(tmp_path)
     decision = RuntimeDecision(
@@ -244,3 +261,40 @@ def test_readiness_confirmation_sequentially_updates_only_target_lines(tmp_path:
     assert ":hourglass_flowing_sand: Core @owner-core" in first_text
     assert ":white_check_mark: Growth @owner" in second_text
     assert ":white_check_mark: Core @owner-core" in second_text
+
+
+def test_rc_branch_notice_is_sent_to_channel_not_thread(tmp_path: Path) -> None:
+    workflow, gateway = _build_workflow(tmp_path)
+    decision = RuntimeDecision(
+        next_step=ReleaseStep.READY_FOR_BRANCH_CUT,
+        next_state=WorkflowState(
+            active_release=ReleaseContext(
+                release_version="5.105.0",
+                step=ReleaseStep.READY_FOR_BRANCH_CUT,
+                slack_channel_id="C_RELEASE",
+                thread_ts={
+                    "manual_release_confirmation": "111.200",
+                    "start_approval": "111.300",
+                },
+            )
+        ),
+        tool_calls=[],
+        audit_reason="readiness_complete",
+        flow_lifecycle="completed",
+    )
+    call = {
+        "args": {
+            "channel_id": "C_RELEASE",
+            "text": "Можно выделять RC ветку",
+        }
+    }
+
+    workflow._execute_slack_message(call=call, decision=decision, events=[])  # noqa: SLF001
+
+    assert gateway.sent_payloads == [
+        {
+            "channel_id": "C_RELEASE",
+            "text": "Можно выделять RC ветку",
+            "thread_ts": "",
+        }
+    ]

@@ -138,7 +138,7 @@ def test_resolve_tool_calls_prefers_payload_list_over_partial_native(monkeypatch
                 "args": {
                     "channel_id": "C0AGLKF6KHD",
                     "message_ts": "1772178090.522069",
-                    "text": "Подтвердите создание релиза 5.104.0 в JIRA",
+                    "text": "Подтвердите создание релиза 5.104.0 в JIRA. <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>",
                 },
             },
             {
@@ -159,7 +159,7 @@ def test_resolve_tool_calls_prefers_payload_list_over_partial_native(monkeypatch
             "args": {
                 "channel_id": "C0AGLKF6KHD",
                 "message_ts": "1772178090.522069",
-                "text": "Подтвердите создание релиза 5.104.0 в JIRA",
+                "text": "Подтвердите создание релиза 5.104.0 в JIRA. <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>",
             },
         }
     ]

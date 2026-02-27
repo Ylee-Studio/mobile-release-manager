@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -159,6 +160,13 @@ class RuntimeCoordinator:
         now: datetime | None = None,
         trigger_reason: str = "event_trigger",
     ) -> RuntimeDecision:
+        kickoff_started_at = time.perf_counter()
+        self.logger.info(
+            "kickoff_decision_start trigger_reason=%s event_count=%s current_step=%s",
+            trigger_reason,
+            len(events),
+            state.step.value,
+        )
         payload = {
             "state": state.to_dict(),
             "events": [self._event_to_dict(event) for event in events],
@@ -176,6 +184,15 @@ class RuntimeCoordinator:
             if isinstance(result, RuntimeDecision):
                 decision = result
                 self._finalize_flow_metadata(decision=decision, previous_state=state)
+                elapsed_ms = int((time.perf_counter() - kickoff_started_at) * 1000)
+                self.logger.info(
+                    "kickoff_decision_done trigger_reason=%s elapsed_ms=%s event_count=%s next_step=%s lifecycle=%s",
+                    trigger_reason,
+                    elapsed_ms,
+                    len(events),
+                    decision.next_step.value,
+                    decision.flow_lifecycle,
+                )
                 return decision
             parsed_payload = _extract_structured_payload(result)
             decision = RuntimeDecision.from_payload(
@@ -186,9 +203,26 @@ class RuntimeCoordinator:
                 native_tool_calls=extract_native_tool_calls(result),
             )
             self._finalize_flow_metadata(decision=decision, previous_state=state)
+            elapsed_ms = int((time.perf_counter() - kickoff_started_at) * 1000)
+            self.logger.info(
+                "kickoff_decision_done trigger_reason=%s elapsed_ms=%s event_count=%s next_step=%s lifecycle=%s",
+                trigger_reason,
+                elapsed_ms,
+                len(events),
+                decision.next_step.value,
+                decision.flow_lifecycle,
+            )
             return decision
         except Exception as exc:  # pragma: no cover - defensive path for runtime robustness
             self.logger.exception("runtime decide failed: %s", exc)
+            elapsed_ms = int((time.perf_counter() - kickoff_started_at) * 1000)
+            self.logger.info(
+                "kickoff_decision_failed trigger_reason=%s elapsed_ms=%s event_count=%s error=%s",
+                trigger_reason,
+                elapsed_ms,
+                len(events),
+                exc.__class__.__name__,
+            )
             return RuntimeDecision(
                 next_step=state.step,
                 next_state=state,
@@ -307,6 +341,7 @@ class DirectLLMRuntime:
 
     def __init__(self, *, policy: PolicyConfig) -> None:
         self.policy = policy
+        self._agent_retries = 3
         self._agent = self._build_agent()
 
     def _build_agent(self) -> Agent:
@@ -324,7 +359,7 @@ class DirectLLMRuntime:
             model=model,
             output_type=AgentDecision,
             system_prompt="You are a release workflow orchestrator. Make decisions about workflow state transitions.",
-            retries=3,  # Auto-retry on validation errors
+            retries=self._agent_retries,  # Auto-retry on validation errors
         )
 
     def _build_user_prompt(
@@ -353,6 +388,64 @@ class DirectLLMRuntime:
         # Combine context with task description
         return context + description
 
+    async def _run_agent_async(
+        self,
+        *,
+        prompt: str,
+        model_name: str,
+        trigger_reason: str,
+    ) -> Any:
+        """Run agent inside coroutine to log exact pre-await point."""
+        logger = logging.getLogger("runtime_engine")
+        started_at = time.perf_counter()
+        logger.info(
+            "openai_request_start model=%s trigger_reason=%s configured_retries=%s",
+            model_name,
+            trigger_reason,
+            self._agent_retries,
+        )
+        result = await self._agent.run(prompt)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+
+        all_messages_count = 0
+        model_response_count = 0
+        retry_prompt_count = 0
+        model_request_count = 0
+        try:
+            all_messages = result.all_messages()
+            all_messages_count = len(all_messages)
+            for message in all_messages:
+                name = type(message).__name__
+                if name == "ModelResponse":
+                    model_response_count += 1
+                elif name == "ModelRequest":
+                    model_request_count += 1
+                elif name == "RetryPromptPart":
+                    retry_prompt_count += 1
+        except Exception:
+            # Best-effort diagnostics only; never break runtime flow.
+            pass
+
+        logger.info(
+            "openai_request_done model=%s trigger_reason=%s elapsed_ms=%s model_requests=%s model_responses=%s retry_prompts=%s all_messages=%s",
+            model_name,
+            trigger_reason,
+            elapsed_ms,
+            model_request_count,
+            model_response_count,
+            retry_prompt_count,
+            all_messages_count,
+        )
+        if model_response_count > 1 or retry_prompt_count > 0:
+            logger.warning(
+                "openai_request_retry_detected reason=structured_output_validation_or_retry model=%s trigger_reason=%s model_responses=%s retry_prompts=%s",
+                model_name,
+                trigger_reason,
+                model_response_count,
+                retry_prompt_count,
+            )
+        return result
+
     def _run_agent_sync(
         self,
         payload: dict[str, Any],
@@ -367,19 +460,65 @@ class DirectLLMRuntime:
         nest_asyncio.apply()
 
         prompt = self._build_user_prompt(payload=payload, task=task)
+        prompt_chars = len(prompt)
+        model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+        trigger_reason = str(payload.get("trigger_reason", "event_trigger"))
+        started_at = time.perf_counter()
 
         # Get or create event loop and run async agent
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 # We're in an async context, use nest_asyncio
-                result = asyncio.run(self._agent.run(prompt))
+                result = asyncio.run(
+                    self._run_agent_async(
+                        prompt=prompt,
+                        model_name=model_name,
+                        trigger_reason=trigger_reason,
+                    )
+                )
             else:
-                result = loop.run_until_complete(self._agent.run(prompt))
+                result = loop.run_until_complete(
+                    self._run_agent_async(
+                        prompt=prompt,
+                        model_name=model_name,
+                        trigger_reason=trigger_reason,
+                    )
+                )
         except RuntimeError:
             # No event loop, create one
-            result = asyncio.run(self._agent.run(prompt))
+            result = asyncio.run(
+                self._run_agent_async(
+                    prompt=prompt,
+                    model_name=model_name,
+                    trigger_reason=trigger_reason,
+                )
+            )
 
+        llm_elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        usage = None
+        try:
+            usage = result.usage()
+        except Exception:
+            usage = None
+
+        request_tokens = getattr(usage, "request_tokens", None)
+        response_tokens = getattr(usage, "response_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        requests = getattr(usage, "requests", None)
+        usage_unavailable = usage is None
+        logging.getLogger("runtime_engine").info(
+            "llm_usage model=%s trigger_reason=%s request_tokens=%s response_tokens=%s total_tokens=%s requests=%s llm_elapsed_ms=%s prompt_chars=%s usage_unavailable=%s",
+            model_name,
+            trigger_reason,
+            request_tokens,
+            response_tokens,
+            total_tokens,
+            requests,
+            llm_elapsed_ms,
+            prompt_chars,
+            usage_unavailable,
+        )
         return result.output
 
     def decide_payload(self, *, payload: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:

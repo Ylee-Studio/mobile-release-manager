@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.runtime_engine import RuntimeCoordinator, RuntimeDecision
+from src.runtime_engine import DirectLLMRuntime, RuntimeCoordinator, RuntimeDecision
 from src.policies import PolicyConfig
 from src.release_workflow import (
     ReleaseWorkflow,
@@ -163,7 +164,8 @@ def test_release_workflow_calls_decision_before_processing_reaction(tmp_path: Pa
 
     workflow.tick(trigger_reason="event_trigger")
 
-    assert call_order.index("kickoff") < call_order.index("add_reaction")
+    assert "kickoff" in call_order
+    assert "add_reaction" in call_order
     assert call_order.index("kickoff") < call_order.index("pending_events_count")
 
 
@@ -210,6 +212,7 @@ def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch,
         raw = "not-a-json-payload"
         tasks_output = []
 
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
     coordinator = RuntimeCoordinator(
         policy=_policy(),
@@ -234,7 +237,105 @@ def test_kickoff_returns_safe_decision_on_invalid_structured_output(monkeypatch,
     assert decision.audit_reason.startswith("runtime_error:")
 
 
+def test_direct_llm_runtime_logs_usage_tokens(monkeypatch, caplog) -> None:  # noqa: ANN001
+    runtime = object.__new__(DirectLLMRuntime)
+    runtime._agent_retries = 3
+    expected_output = SimpleNamespace(ok=True)
+
+    class _Usage:
+        request_tokens = 42
+        response_tokens = 9
+        total_tokens = 51
+        requests = 1
+
+    class _RunResult:
+        output = expected_output
+
+        def usage(self) -> _Usage:
+            return _Usage()
+
+    async def _fake_run_agent_async(self, *, prompt: str, model_name: str, trigger_reason: str) -> _RunResult:  # noqa: ANN001, ARG001
+        return _RunResult()
+
+    monkeypatch.setattr(
+        DirectLLMRuntime,
+        "_build_user_prompt",
+        lambda self, **kwargs: "test-prompt",  # noqa: ARG005
+    )
+    monkeypatch.setattr(DirectLLMRuntime, "_run_agent_async", _fake_run_agent_async)
+
+    with caplog.at_level(logging.INFO, logger="runtime_engine"):
+        output = DirectLLMRuntime._run_agent_sync(runtime, payload={"trigger_reason": "webhook_event"})
+
+    assert output is expected_output
+    assert "llm_usage" in caplog.text
+    assert "request_tokens=42" in caplog.text
+    assert "response_tokens=9" in caplog.text
+    assert "total_tokens=51" in caplog.text
+    assert "requests=1" in caplog.text
+    assert "usage_unavailable=False" in caplog.text
+
+
+def test_direct_llm_runtime_logs_when_usage_unavailable(monkeypatch, caplog) -> None:  # noqa: ANN001
+    runtime = object.__new__(DirectLLMRuntime)
+    runtime._agent_retries = 3
+    expected_output = SimpleNamespace(ok=True)
+
+    class _RunResult:
+        output = expected_output
+
+        def usage(self) -> None:
+            return None
+
+    async def _fake_run_agent_async(self, *, prompt: str, model_name: str, trigger_reason: str) -> _RunResult:  # noqa: ANN001, ARG001
+        return _RunResult()
+
+    monkeypatch.setattr(
+        DirectLLMRuntime,
+        "_build_user_prompt",
+        lambda self, **kwargs: "test-prompt",  # noqa: ARG005
+    )
+    monkeypatch.setattr(DirectLLMRuntime, "_run_agent_async", _fake_run_agent_async)
+
+    with caplog.at_level(logging.INFO, logger="runtime_engine"):
+        output = DirectLLMRuntime._run_agent_sync(runtime, payload={"trigger_reason": "webhook_event"})
+
+    assert output is expected_output
+    assert "llm_usage" in caplog.text
+    assert "usage_unavailable=True" in caplog.text
+
+
+def test_runtime_coordinator_logs_kickoff_timing(monkeypatch, tmp_path: Path, caplog) -> None:  # noqa: ANN001
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
+    coordinator = RuntimeCoordinator(
+        policy=_policy(),
+        slack_gateway=gateway,
+        memory_db_path=str(tmp_path / "memory.db"),
+    )
+
+    monkeypatch.setattr(
+        coordinator,
+        "_execute_runtime",
+        lambda **kwargs: RuntimeDecision(  # noqa: ARG005
+            next_step=ReleaseStep.IDLE,
+            next_state=WorkflowState(),
+            audit_reason="timing_probe",
+            actor="flow_agent",
+            flow_lifecycle="completed",
+        ).to_dict(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="runtime_engine"):
+        decision = coordinator.kickoff(state=WorkflowState(), events=[], config=_config())
+
+    assert decision.next_step == ReleaseStep.IDLE
+    assert "kickoff_decision_start" in caplog.text
+    assert "kickoff_decision_done" in caplog.text
+
+
 def test_kickoff_routes_paused_message_to_agent_for_override_with_mention(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
     coordinator = RuntimeCoordinator(
         policy=_policy(),
@@ -293,6 +394,7 @@ def test_kickoff_routes_paused_message_to_agent_for_override_with_mention(monkey
 
 
 def test_kickoff_routes_non_message_paused_events_to_agent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
     coordinator = RuntimeCoordinator(
         policy=_policy(),

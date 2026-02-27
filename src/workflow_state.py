@@ -49,6 +49,39 @@ def coerce_release_step(value: Any, *, fallback: ReleaseStep) -> ReleaseStep:
     return fallback
 
 
+def _coerce_string_dict(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, raw in value.items():
+        if raw is None:
+            continue
+        key_str = str(key).strip()
+        if not key_str:
+            continue
+        if isinstance(raw, str):
+            normalized = raw.strip()
+            if normalized:
+                result[key_str] = normalized
+            continue
+        # Be tolerant to numeric timestamps from external payloads.
+        if isinstance(raw, (int, float)):
+            result[key_str] = str(raw)
+    return result
+
+
+def _coerce_bool_dict(value: Any) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, bool] = {}
+    for key, raw in value.items():
+        key_str = str(key).strip()
+        if not key_str or not isinstance(raw, bool):
+            continue
+        result[key_str] = raw
+    return result
+
+
 class ReleaseContext(BaseModel):
     release_version: str
     step: ReleaseStep
@@ -120,9 +153,9 @@ class WorkflowState(BaseModel):
                 readiness_raw = active_raw.get("readiness_map", active_raw.get("readiness", {}))
                 channel_id = active_raw.get("slack_channel_id") or active_raw.get("channel_id")
 
-                message_ts = message_ts_raw if isinstance(message_ts_raw, dict) else {}
-                thread_ts = thread_ts_raw if isinstance(thread_ts_raw, dict) else {}
-                readiness_map = readiness_raw if isinstance(readiness_raw, dict) else {}
+                message_ts = _coerce_string_dict(message_ts_raw)
+                thread_ts = _coerce_string_dict(thread_ts_raw)
+                readiness_map = _coerce_bool_dict(readiness_raw)
 
                 active_release = ReleaseContext(
                     release_version=release_version,

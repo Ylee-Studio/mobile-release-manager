@@ -93,7 +93,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- Add slack_update for approved start-approval message.\n"
             '  Args: {channel_id, message_ts, text: "Подтверждено :white_check_mark:"} (runtime appends confirmation to original message text from event metadata)\n'
             "- Add exactly ONE slack_approve tool call for Jira release creation:\n"
-            '  Args: {channel_id, text: "Подтвердите создание релиза {version} в JIRA", approve_label: "Подтвердить"}\n'
+            '  Args: {channel_id, text: "Подтвердите создание релиза {version} в JIRA. <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>", approve_label: "Подтвердить"}\n'
             "- Save message_ts from this approval message to active_release.message_ts['manual_release_confirmation']\n"
             "- Return flow_lifecycle='paused' (waiting for human)\n\n"
             "### 3. On approval_confirmed event (button clicked)\n"
@@ -140,7 +140,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "  * unmatched points remain ':hourglass_flowing_sand:'\n"
             "- If ALL points from config.readiness_owners are true:\n"
             "  * Set next_step = READY_FOR_BRANCH_CUT\n"
-            '  * Add exactly ONE slack_message tool call with text: "Можно выделять RC ветку"\n'
+            '  * Add exactly ONE slack_message tool call with text: "Можно выделять RC ветку" (в канал, без thread_ts)\n'
             "  * Return flow_lifecycle='running'\n"
             "- Otherwise stay in WAIT_READINESS_CONFIRMATIONS with flow_lifecycle='paused'\n\n"
             "### 7. READY_FOR_BRANCH_CUT\n"
@@ -170,7 +170,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             '      "reason": "Request release creation confirmation",\n'
             '      "args": {\n'
             '        "channel_id": "C123",\n'
-            '        "text": "Подтвердите создание релиза 5.105.0 в JIRA",\n'
+            '        "text": "Подтвердите создание релиза 5.105.0 в JIRA. <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>",\n'
             '        "approve_label": "Подтвердить"\n'
             '      }\n'
             '    }\n'
