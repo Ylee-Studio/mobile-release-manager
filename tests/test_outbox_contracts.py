@@ -41,6 +41,28 @@ def test_slack_gateway_calls_real_api(tmp_path) -> None:
     assert approve_payload["blocks"][1]["elements"][0]["action_id"] == "release_approve"
 
 
+def test_slack_gateway_send_approve_supports_optional_reject_button(tmp_path) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeClient:
+        def chat_postMessage(self, **kwargs):  # noqa: ANN003
+            captured.append(("chat.postMessage", kwargs))
+            return {"ok": True, "ts": "1700000000.123456"}
+
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "slack_events.jsonl")
+    gateway.client = _FakeClient()
+
+    gateway.send_approve(
+        channel_id="C_RELEASE",
+        text="please approve",
+        approve_label="Подтвердить",
+        reject_label="Отклонить",
+    )
+
+    elements = captured[0][1]["blocks"][1]["elements"]
+    assert [element["action_id"] for element in elements] == ["release_approve", "release_reject"]
+
+
 def test_slack_gateway_surfaces_api_errors(tmp_path) -> None:
     class _FailingClient:
         def chat_postMessage(self, **kwargs):  # noqa: ANN003, ARG002

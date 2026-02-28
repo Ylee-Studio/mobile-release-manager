@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from src.release_workflow import ReleaseWorkflow, RuntimeConfig
 from src.runtime_engine import RuntimeDecision
+from src.tools.slack_tools import SlackEvent
 from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 
 
@@ -21,6 +21,42 @@ class _NoopSlackGateway:
     def add_reaction(self, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:  # noqa: ARG002
         return True
 
+
+@dataclass
+class _EventSlackGateway:
+    events: list[SlackEvent]
+    reaction_calls: list[dict[str, str]] | None = None
+    sent_messages: list[dict[str, str]] | None = None
+
+    def poll_events(self) -> list[Any]:
+        return list(self.events)
+
+    def pending_events_count(self) -> int:
+        return 0
+
+    def add_reaction(self, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:
+        if self.reaction_calls is None:
+            self.reaction_calls = []
+        self.reaction_calls.append(
+            {
+                "channel_id": channel_id,
+                "message_ts": message_ts,
+                "emoji": emoji,
+            }
+        )
+        return True
+
+    def send_message(self, channel_id: str, text: str, *, thread_ts: str | None = None) -> dict[str, str]:
+        if self.sent_messages is None:
+            self.sent_messages = []
+        self.sent_messages.append(
+            {
+                "channel_id": channel_id,
+                "text": text,
+                "thread_ts": thread_ts or "",
+            }
+        )
+        return {"message_ts": "1700000000.555555"}
 
 @dataclass
 class _StateStore:
@@ -46,10 +82,19 @@ class _RuntimeStub:
 class _GitHubGatewayStub:
     trigger_calls: int = 0
     poll_calls: int = 0
+    trigger_payloads: list[dict[str, Any]] | None = None
 
     def trigger_workflow(self, *, workflow_file: str, ref: str, inputs: dict[str, Any]) -> Any:
-        _ = (workflow_file, ref, inputs)
         self.trigger_calls += 1
+        if self.trigger_payloads is None:
+            self.trigger_payloads = []
+        self.trigger_payloads.append(
+            {
+                "workflow_file": workflow_file,
+                "ref": ref,
+                "inputs": dict(inputs),
+            }
+        )
         return type("Run", (), {"run_id": 101, "status": "queued", "conclusion": None})()
 
     def get_workflow_run(self, *, run_id: int) -> Any:
@@ -86,10 +131,10 @@ def test_github_action_dispatch_sets_run_context(tmp_path: Path) -> None:
     )
     decision_state = WorkflowState.from_dict(state.to_dict())
     assert decision_state.active_release is not None
-    decision_state.active_release.set_step(ReleaseStep.WAIT_BRANCH_CUT)
+    decision_state.active_release.set_step(ReleaseStep.WAIT_BRANCH_CUT_APPROVAL)
     runtime = _RuntimeStub(
         decision=RuntimeDecision(
-            next_step=ReleaseStep.WAIT_BRANCH_CUT,
+            next_step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
             next_state=decision_state,
             tool_calls=[
                 {
@@ -120,28 +165,27 @@ def test_github_action_dispatch_sets_run_context(tmp_path: Path) -> None:
     assert github.trigger_calls == 1
     assert github.poll_calls == 0
     assert next_state.active_release is not None
-    assert next_state.active_release.step == ReleaseStep.WAIT_BRANCH_CUT
+    assert next_state.active_release.step == ReleaseStep.WAIT_BRANCH_CUT_APPROVAL
     assert next_state.active_release.github_action_run_id == 101
     assert next_state.active_release.github_action_status == "queued"
 
 
-def test_wait_branch_cut_polls_every_30s_and_moves_to_approval(tmp_path: Path) -> None:
+def test_wait_branch_cut_approval_does_not_poll_github_after_dispatch(tmp_path: Path) -> None:
     state = WorkflowState(
         active_release=ReleaseContext(
             release_version="5.105.0",
-            step=ReleaseStep.WAIT_BRANCH_CUT,
+            step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
             slack_channel_id="C_RELEASE",
             github_action_run_id=202,
             github_action_status="in_progress",
-            github_action_last_polled_at=(datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat(),
         )
     )
     runtime = _RuntimeStub(
         decision=RuntimeDecision(
-            next_step=ReleaseStep.WAIT_BRANCH_CUT,
+            next_step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
             next_state=WorkflowState.from_dict(state.to_dict()),
             tool_calls=[],
-            audit_reason="waiting_for_branch_cut_action",
+            audit_reason="waiting_for_branch_cut_approval",
             flow_lifecycle="paused",
         )
     )
@@ -156,8 +200,303 @@ def test_wait_branch_cut_polls_every_30s_and_moves_to_approval(tmp_path: Path) -
 
     next_state = workflow.tick(trigger_reason="manual_tick")
 
-    assert github.poll_calls == 1
+    assert github.poll_calls == 0
     assert next_state.active_release is not None
     assert next_state.active_release.step == ReleaseStep.WAIT_BRANCH_CUT_APPROVAL
-    assert next_state.active_release.github_action_status == "completed"
-    assert next_state.active_release.github_action_conclusion == "success"
+    assert next_state.active_release.github_action_status == "in_progress"
+
+
+def test_stateless_github_action_trigger_does_not_change_state(tmp_path: Path) -> None:
+    state = WorkflowState()
+    runtime = _RuntimeStub(
+        decision=RuntimeDecision(
+            next_step=ReleaseStep.IDLE,
+            next_state=WorkflowState.from_dict(state.to_dict()),
+            tool_calls=[
+                {
+                    "tool": "github_action",
+                    "reason": "manual build rc",
+                    "args": {
+                        "workflow_file": "build_rc.yml",
+                        "ref": "dev",
+                        "inputs": {},
+                    },
+                }
+            ],
+            audit_reason="manual_build_rc_trigger",
+            flow_lifecycle="running",
+        )
+    )
+    github = _GitHubGatewayStub()
+    workflow = ReleaseWorkflow(
+        config=_config(tmp_path),
+        slack_gateway=_NoopSlackGateway(),  # type: ignore[arg-type]
+        state_store=_StateStore(state=state),
+        runtime_engine=runtime,
+        github_gateway=github,  # type: ignore[arg-type]
+    )
+
+    next_state = workflow.tick(trigger_reason="manual_tick")
+
+    assert github.trigger_calls == 1
+    assert github.trigger_payloads == [
+        {
+            "workflow_file": "build_rc.yml",
+            "ref": "dev",
+            "inputs": {},
+        }
+    ]
+    assert next_state.to_dict() == state.to_dict()
+
+
+def test_active_release_build_rc_does_not_append_version_or_mutate_run_context(tmp_path: Path) -> None:
+    state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.105.0",
+            step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
+            slack_channel_id="C_RELEASE",
+        )
+    )
+    runtime = _RuntimeStub(
+        decision=RuntimeDecision(
+            next_step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
+            next_state=WorkflowState.from_dict(state.to_dict()),
+            tool_calls=[
+                {
+                    "tool": "github_action",
+                    "reason": "manual build rc",
+                    "args": {
+                        "workflow_file": "build_rc.yml",
+                        "ref": "dev",
+                        "inputs": {},
+                    },
+                }
+            ],
+            audit_reason="manual_build_rc_trigger",
+            flow_lifecycle="paused",
+        )
+    )
+    github = _GitHubGatewayStub()
+    workflow = ReleaseWorkflow(
+        config=_config(tmp_path),
+        slack_gateway=_NoopSlackGateway(),  # type: ignore[arg-type]
+        state_store=_StateStore(state=state),
+        runtime_engine=runtime,
+        github_gateway=github,  # type: ignore[arg-type]
+    )
+
+    next_state = workflow.tick(trigger_reason="manual_tick")
+
+    assert github.trigger_calls == 1
+    assert github.trigger_payloads == [
+        {
+            "workflow_file": "build_rc.yml",
+            "ref": "dev",
+            "inputs": {},
+        }
+    ]
+    assert next_state.active_release is not None
+    assert next_state.active_release.github_action_run_id is None
+    assert next_state.active_release.github_action_status is None
+    assert next_state.active_release.github_action_conclusion is None
+
+
+def test_build_rc_adds_white_check_mark_reaction(tmp_path: Path) -> None:
+    state = WorkflowState()
+    runtime = _RuntimeStub(
+        decision=RuntimeDecision(
+            next_step=ReleaseStep.IDLE,
+            next_state=WorkflowState.from_dict(state.to_dict()),
+            tool_calls=[
+                {
+                    "tool": "github_action",
+                    "reason": "manual build rc",
+                    "args": {
+                        "workflow_file": "build_rc.yml",
+                        "ref": "dev",
+                        "inputs": {},
+                    },
+                }
+            ],
+            audit_reason="manual_build_rc_trigger",
+            flow_lifecycle="running",
+        )
+    )
+    gateway = _EventSlackGateway(
+        events=[
+            SlackEvent(
+                event_id="evt-100",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="Собери сборку",
+                message_ts="1700000000.111111",
+            )
+        ]
+    )
+    github = _GitHubGatewayStub()
+    workflow = ReleaseWorkflow(
+        config=_config(tmp_path),
+        slack_gateway=gateway,  # type: ignore[arg-type]
+        state_store=_StateStore(state=state),
+        runtime_engine=runtime,
+        github_gateway=github,  # type: ignore[arg-type]
+    )
+
+    workflow.tick(trigger_reason="manual_tick")
+
+    assert github.trigger_calls == 1
+    assert gateway.reaction_calls is not None
+    assert any(call["emoji"] == "white_check_mark" for call in gateway.reaction_calls)
+
+
+def test_manual_override_adds_white_check_mark_reaction(tmp_path: Path) -> None:
+    state = WorkflowState()
+    runtime = _RuntimeStub(
+        decision=RuntimeDecision(
+            next_step=ReleaseStep.IDLE,
+            next_state=WorkflowState.from_dict(state.to_dict()),
+            tool_calls=[],
+            audit_reason="manual_status_override:5.105.0->IDLE",
+            flow_lifecycle="completed",
+        )
+    )
+    gateway = _EventSlackGateway(
+        events=[
+            SlackEvent(
+                event_id="evt-101",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="Переведи 5.105.0 в IDLE",
+                message_ts="1700000000.222222",
+            )
+        ]
+    )
+    workflow = ReleaseWorkflow(
+        config=_config(tmp_path),
+        slack_gateway=gateway,  # type: ignore[arg-type]
+        state_store=_StateStore(state=state),
+        runtime_engine=runtime,
+        github_gateway=_GitHubGatewayStub(),  # type: ignore[arg-type]
+    )
+
+    workflow.tick(trigger_reason="manual_tick")
+
+    assert gateway.reaction_calls is not None
+    assert any(call["emoji"] == "white_check_mark" for call in gateway.reaction_calls)
+
+
+def test_active_release_build_rc_adds_white_check_mark_reaction(tmp_path: Path) -> None:
+    state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.105.0",
+            step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
+            slack_channel_id="C_RELEASE",
+        )
+    )
+    runtime = _RuntimeStub(
+        decision=RuntimeDecision(
+            next_step=ReleaseStep.WAIT_MEETING_CONFIRMATION,
+            next_state=WorkflowState.from_dict(state.to_dict()),
+            tool_calls=[
+                {
+                    "tool": "github_action",
+                    "reason": "manual build rc",
+                    "args": {
+                        "workflow_file": "build_rc.yml",
+                        "ref": "dev",
+                        "inputs": {},
+                    },
+                }
+            ],
+            audit_reason="manual_build_rc_trigger",
+            flow_lifecycle="paused",
+        )
+    )
+    gateway = _EventSlackGateway(
+        events=[
+            SlackEvent(
+                event_id="evt-102",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="Собери сборку",
+                message_ts="1700000000.333333",
+            )
+        ]
+    )
+    github = _GitHubGatewayStub()
+    workflow = ReleaseWorkflow(
+        config=_config(tmp_path),
+        slack_gateway=gateway,  # type: ignore[arg-type]
+        state_store=_StateStore(state=state),
+        runtime_engine=runtime,
+        github_gateway=github,  # type: ignore[arg-type]
+    )
+
+    workflow.tick(trigger_reason="manual_tick")
+
+    assert github.trigger_calls == 1
+    assert gateway.reaction_calls is not None
+    assert any(call["emoji"] == "white_check_mark" for call in gateway.reaction_calls)
+
+
+def test_wait_rc_readiness_message_adds_white_check_mark_reaction(tmp_path: Path) -> None:
+    state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.105.0",
+            step=ReleaseStep.WAIT_RC_READINESS,
+            slack_channel_id="C_RELEASE",
+        ),
+        flow_execution_id="flow-rc-ready-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_RC_READINESS",
+    )
+    runtime = _RuntimeStub(
+        decision=RuntimeDecision(
+            next_step=ReleaseStep.IDLE,
+            next_state=WorkflowState(active_release=None),
+            tool_calls=[
+                {
+                    "tool": "slack_message",
+                    "reason": "celebrate release finish",
+                    "args": {
+                        "channel_id": "C_RELEASE",
+                        "text": "Поздравляю, релиз завершен :tada: Отличная работа команды :rocket:",
+                    },
+                }
+            ],
+            audit_reason="release_ready_for_send",
+            flow_lifecycle="completed",
+        )
+    )
+    gateway = _EventSlackGateway(
+        events=[
+            SlackEvent(
+                event_id="evt-103",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="Релиз готов к отправке",
+                message_ts="1700000000.444444",
+            )
+        ]
+    )
+    workflow = ReleaseWorkflow(
+        config=_config(tmp_path),
+        slack_gateway=gateway,  # type: ignore[arg-type]
+        state_store=_StateStore(state=state),
+        runtime_engine=runtime,
+        github_gateway=_GitHubGatewayStub(),  # type: ignore[arg-type]
+    )
+
+    next_state = workflow.tick(trigger_reason="manual_tick")
+
+    assert next_state.step == ReleaseStep.IDLE
+    assert next_state.active_release is None
+    assert gateway.sent_messages == [
+        {
+            "channel_id": "C_RELEASE",
+            "text": "Поздравляю, релиз завершен :tada: Отличная работа команды :rocket:",
+            "thread_ts": "1700000000.444444",
+        }
+    ]
+    assert gateway.reaction_calls is not None
+    assert any(call["emoji"] == "white_check_mark" for call in gateway.reaction_calls)

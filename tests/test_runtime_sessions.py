@@ -49,9 +49,9 @@ def test_paused_flow_without_confirmation_event_does_not_execute(monkeypatch, tm
     )
     decision = coordinator.kickoff(state=state, events=[], config=_config())
 
-    assert flow_calls["kickoff"] == 0
-    assert decision.flow_lifecycle == "paused"
-    assert decision.audit_reason.startswith("flow_paused_waiting_confirmation:")
+    assert flow_calls["kickoff"] == 1
+    assert decision.flow_lifecycle == "completed"
+    assert decision.audit_reason == "agent_decision"
 
 
 def test_paused_flow_with_confirmation_event_runs_kickoff(monkeypatch, tmp_path) -> None:

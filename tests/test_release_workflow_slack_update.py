@@ -13,6 +13,7 @@ from src.workflow_state import ReleaseContext, ReleaseStep, WorkflowState
 class _DummySlackGateway:
     updated_payloads: list[dict[str, str]]
     sent_payloads: list[dict[str, str]]
+    approve_payloads: list[dict[str, str]]
 
     def update_message(self, channel_id: str, message_ts: str, text: str) -> dict[str, str]:
         self.updated_payloads.append(
@@ -33,6 +34,24 @@ class _DummySlackGateway:
             }
         )
         return {"message_ts": "200.300"}
+
+    def send_approve(
+        self,
+        channel_id: str,
+        text: str,
+        approve_label: str,
+        *,
+        reject_label: str | None = None,
+    ) -> dict[str, str]:
+        self.approve_payloads.append(
+            {
+                "channel_id": channel_id,
+                "text": text,
+                "approve_label": approve_label,
+                "reject_label": reject_label or "",
+            }
+        )
+        return {"message_ts": "300.400"}
 
 
 @dataclass
@@ -79,7 +98,7 @@ def _build_workflow(tmp_path: Path) -> tuple[ReleaseWorkflow, _DummySlackGateway
             slack_channel_id="C_RELEASE",
         )
     )
-    slack_gateway = _DummySlackGateway(updated_payloads=[], sent_payloads=[])
+    slack_gateway = _DummySlackGateway(updated_payloads=[], sent_payloads=[], approve_payloads=[])
     workflow = ReleaseWorkflow(
         config=_config(tmp_path),
         slack_gateway=slack_gateway,  # type: ignore[arg-type]
@@ -163,6 +182,30 @@ def test_slack_update_falls_back_to_args_text_when_trigger_message_missing(tmp_p
     workflow._execute_slack_update(call=call, decision=decision, events=events)  # noqa: SLF001
 
     assert gateway.updated_payloads[0]["text"] == "Базовый текст\n\nПодтверждено :white_check_mark:"
+
+
+def test_slack_update_marks_rejected_message_with_reject_suffix(tmp_path: Path) -> None:
+    workflow, gateway = _build_workflow(tmp_path)
+    decision = _decision()
+    call = {"args": {"channel_id": "C_RELEASE", "message_ts": "111.222", "text": "Отклонено :x:"}}
+    events = [
+        SimpleNamespace(
+            event_type="approval_rejected",
+            channel_id="C_RELEASE",
+            message_ts="111.222",
+            metadata={"trigger_message_text": "Подтвердите старт релизного трейна 5.105.0"},
+        )
+    ]
+
+    workflow._execute_slack_update(call=call, decision=decision, events=events)  # noqa: SLF001
+
+    assert gateway.updated_payloads == [
+        {
+            "channel_id": "C_RELEASE",
+            "message_ts": "111.222",
+            "text": "Подтвердите старт релизного трейна 5.105.0\n\nОтклонено :x:",
+        }
+    ]
 
 
 def test_slack_update_does_not_append_confirmation_to_readiness_checklist(tmp_path: Path) -> None:
@@ -263,38 +306,34 @@ def test_readiness_confirmation_sequentially_updates_only_target_lines(tmp_path:
     assert ":white_check_mark: Core @owner-core" in second_text
 
 
-def test_rc_branch_notice_is_sent_to_channel_not_thread(tmp_path: Path) -> None:
+def test_branch_cut_approval_uses_expected_slack_approve_text(tmp_path: Path) -> None:
     workflow, gateway = _build_workflow(tmp_path)
     decision = RuntimeDecision(
-        next_step=ReleaseStep.WAIT_BRANCH_CUT,
+        next_step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
         next_state=WorkflowState(
             active_release=ReleaseContext(
                 release_version="5.105.0",
-                step=ReleaseStep.WAIT_BRANCH_CUT,
+                step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
                 slack_channel_id="C_RELEASE",
-                thread_ts={
-                    "manual_release_confirmation": "111.200",
-                    "start_approval": "111.300",
-                },
             )
         ),
         tool_calls=[],
         audit_reason="readiness_complete",
-        flow_lifecycle="completed",
+        flow_lifecycle="paused",
     )
-    call = {
-        "args": {
-            "channel_id": "C_RELEASE",
-            "text": "Можно выделять RC ветку",
-        }
-    }
+    workflow._execute_slack_approve(call={"args": {}}, decision=decision, events=[])  # noqa: SLF001
 
-    workflow._execute_slack_message(call=call, decision=decision, events=[])  # noqa: SLF001
-
-    assert gateway.sent_payloads == [
+    assert gateway.approve_payloads == [
         {
             "channel_id": "C_RELEASE",
-            "text": "Можно выделять RC ветку",
-            "thread_ts": "",
+            "text": (
+                "Выделил RC ветку. Подтвердите "
+                "<https://github.com/Ylee-Studio/instories-ios/actions|готовность> ветки.\n"
+                "- FontThumbnailManager.Spec обновлен при необходимости\n"
+                "- В L10n.extension.swift нет временной локализации\n"
+                "- В TestTemplates.swift нет шаблонов"
+            ),
+            "approve_label": "Подтвердить",
+            "reject_label": "",
         }
     ]

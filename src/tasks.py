@@ -6,7 +6,7 @@ from .runtime_contracts import AgentDecisionPayload
 # Schema definitions for LLM context
 _RELEASE_STEP_VALUES = (
     "IDLE|WAIT_START_APPROVAL|WAIT_MANUAL_RELEASE_CONFIRMATION|"
-    "WAIT_MEETING_CONFIRMATION|WAIT_READINESS_CONFIRMATIONS|WAIT_BRANCH_CUT|WAIT_BRANCH_CUT_APPROVAL"
+    "WAIT_MEETING_CONFIRMATION|WAIT_READINESS_CONFIRMATIONS|WAIT_BRANCH_CUT_APPROVAL|WAIT_RC_READINESS"
 )
 
 _TOOL_SCHEMA_DEFS = """
@@ -14,8 +14,8 @@ Available tools:
 1. slack_message - Send message to Slack channel
    Args: {channel_id: string, text: string, thread_ts?: string}
 
-2. slack_approve - Send approval request with button
-   Args: {channel_id: string, text: string, approve_label: string}
+2. slack_approve - Send approval request with button(s)
+   Args: {channel_id: string, text: string, approve_label: string, reject_label?: string}
 
 3. slack_update - Update existing Slack message
    Args: {channel_id: string, message_ts: string, text: string}
@@ -74,8 +74,8 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- If message starts with Slack mention(s) like '<@U...>', ignore mention prefix and parse remaining text\n"
             "Allowed STATUS values:\n"
             "- Any ReleaseStep value: IDLE, WAIT_START_APPROVAL, WAIT_MANUAL_RELEASE_CONFIRMATION, "
-            "WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, WAIT_BRANCH_CUT, "
-            "WAIT_BRANCH_CUT_APPROVAL\n"
+            "WAIT_MEETING_CONFIRMATION, WAIT_READINESS_CONFIRMATIONS, WAIT_BRANCH_CUT_APPROVAL, "
+            "WAIT_RC_READINESS\n"
             "Actions:\n"
             "- Parse release version from message text (must match X.Y.Z)\n"
             "- Parse STATUS and convert to next_step\n"
@@ -84,6 +84,18 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- If STATUS resolves to IDLE: clear active_release, clear pause metadata, set flow_lifecycle='completed'\n"
             "- Otherwise: set/create active_release for that version with parsed next_step, set flow_lifecycle='paused'\n"
             "- Set audit_reason to 'manual_status_override:{release_version}->{next_step}'\n\n"
+            "### 0.5 Manual build trigger command (high priority)\n"
+            "Trigger: events contain message 'Собери сборку' (case-insensitive)\n"
+            "Message preprocessing:\n"
+            "- If message starts with Slack mention(s) like '<@U...>', ignore mention prefix and parse remaining text\n"
+            "Actions:\n"
+            "- Do not change workflow state: keep next_step equal to current state.step\n"
+            "- Keep next_state empty and state_patch empty\n"
+            "- Add exactly ONE github_action tool call:\n"
+            '  Args: {workflow_file: "build_rc.yml", ref: "dev", inputs: {}}\n'
+            "- Set audit_reason to 'manual_build_rc_trigger'\n"
+            "- Return flow_lifecycle='paused' when current flow is paused, otherwise keep current lifecycle semantics via unchanged state\n"
+            "- Do not generate any slack_* tool calls for this command\n\n"
             "### 1. IDLE → WAIT_START_APPROVAL\n"
             "Trigger: events contain 'manual_start' event with version string (e.g., '5.105.0')\n"
             "Actions:\n"
@@ -91,7 +103,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- Create active_release: {release_version, step: WAIT_START_APPROVAL, slack_channel_id}\n"
             "- Set flow_execution_id to new UUID if not present\n"
             "- Add exactly ONE slack_approve tool call for start approval:\n"
-            '  Args: {channel_id, text: "Подтвердите старт релизного трейна {version}. Если нужен другой номер для релиза, напишите в треде.", approve_label: "Подтвердить"}\n'
+            '  Args: {channel_id, text: "Подтвердите старт релизного трейна {version}. Если нужен другой номер для релиза, напишите в треде.", approve_label: "Подтвердить", reject_label: "Отклонить"}\n'
             "- Set flow_lifecycle='paused' (waiting for start approval)\n"
             "- Do NOT send slack_message instead of slack_approve for this step\n\n"
             "### 2. WAIT_START_APPROVAL → WAIT_MANUAL_RELEASE_CONFIRMATION\n"
@@ -104,6 +116,14 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             '  Args: {channel_id, text: "Подтвердите создание релиза {version} в <https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>.", approve_label: "Подтвердить"}\n'
             "- Save message_ts from this approval message to active_release.message_ts['manual_release_confirmation']\n"
             "- Return flow_lifecycle='paused' (waiting for human)\n\n"
+            "### 2.1 WAIT_START_APPROVAL → IDLE (rejected)\n"
+            "Trigger: approval_rejected received while current step is WAIT_START_APPROVAL\n"
+            "Actions:\n"
+            "- Set next_step = IDLE\n"
+            "- Add slack_update for rejected start-approval message.\n"
+            '  Args: {channel_id, message_ts, text: "Отклонено :x:"} (runtime appends rejection suffix to original message text from event metadata)\n'
+            "- Clear active_release in state_patch/next_state\n"
+            "- Set flow_lifecycle='completed'\n\n"
             "### 3. On approval_confirmed event (button clicked)\n"
             "Trigger: events contain 'approval_confirmed' event\n"
             "Actions:\n"
@@ -111,6 +131,14 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- Add slack_update tool call to mark approval as confirmed:\n"
             '  Args: {channel_id, message_ts, text: "Подтверждено :white_check_mark:"} (runtime appends confirmation to original message text from event metadata)\n'
             "- Transition based on current step\n\n"
+            "### 3.1 On approval_rejected event (button clicked)\n"
+            "Trigger: events contain 'approval_rejected' event\n"
+            "Actions:\n"
+            "- Find matching approval message via message_ts\n"
+            "- Add slack_update tool call to mark rejection:\n"
+            '  Args: {channel_id, message_ts, text: "Отклонено :x:"} (runtime appends rejection suffix to original message text from event metadata)\n'
+            "- If current step is WAIT_START_APPROVAL: transition to IDLE, clear active_release, flow_lifecycle=completed\n"
+            "- For other steps: keep conservative no-op transition (same state, no additional transitions)\n\n"
             "### 4. WAIT_MANUAL_RELEASE_CONFIRMATION → WAIT_MEETING_CONFIRMATION\n"
             "Trigger: approval_confirmed received in WAIT_MANUAL_RELEASE_CONFIRMATION\n"
             "Actions:\n"
@@ -147,23 +175,33 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "  * matched points -> ':white_check_mark:'\n"
             "  * unmatched points remain ':hourglass_flowing_sand:'\n"
             "- If ALL points from config.readiness_owners are true:\n"
-            "  * Set next_step = WAIT_BRANCH_CUT\n"
+            "  * Set next_step = WAIT_BRANCH_CUT_APPROVAL\n"
             "  * Add exactly ONE github_action tool call to trigger release branch workflow:\n"
             '    Args: {workflow_file: "create_release_branch.yml", inputs: {"version": "{version}"}}\n'
-            '  * Add exactly ONE slack_message tool call with text: "Можно выделять RC ветку" (в канал, без thread_ts)\n'
+            "  * Add exactly ONE slack_approve tool call:\n"
+            '    Args: {channel_id, text: "Выделил RС ветку. Подтвердите <https://github.com/Ylee-Studio/instories-ios/actions|готовность> ветки.\\n- FontThumbnailManager.Spec обновлен при необходимости\\n- В L10n.extension.swift нет временной локализации\\n- В TestTemplates.swift нет шаблонов", approve_label: "Подтвердить"}\n'
+            '  * Do NOT send slack_message with text "Можно выделять RC ветку"\n'
             "  * Return flow_lifecycle='paused'\n"
             "- Otherwise stay in WAIT_READINESS_CONFIRMATIONS with flow_lifecycle='paused'\n\n"
-            "### 7. WAIT_BRANCH_CUT\n"
-            "Trigger: release branch action has been started and is being polled by runtime\n"
+            "### 7. WAIT_BRANCH_CUT_APPROVAL\n"
+            "Trigger: approval_confirmed received in WAIT_BRANCH_CUT_APPROVAL\n"
             "Actions:\n"
-            "- Keep current step while action status is queued/in_progress\n"
-            "- Return no tool_calls by default\n"
+            "- Set next_step = WAIT_RC_READINESS\n"
+            "- Add slack_update to mark approval as confirmed:\n"
+            '  Args: {channel_id, message_ts, text: "Подтверждено :white_check_mark:"} (runtime appends confirmation to original message text from event metadata)\n'
             "- Return flow_lifecycle='paused'\n\n"
-            "### 8. WAIT_BRANCH_CUT_APPROVAL\n"
-            "Trigger: runtime detected branch-cut action completed\n"
+            "### 8. WAIT_RC_READINESS\n"
+            "Trigger: events contain message exactly 'Релиз готов к отправке'\n"
             "Actions:\n"
-            "- Hold state for downstream manual approval\n"
-            "- Return flow_lifecycle='paused'\n\n"
+            "- Add exactly ONE slack_message tool call with congratulation text\n"
+            "- The congratulation text must:\n"
+            "  * Be authored by agent (free wording)\n"
+            "  * Be no more than 2 sentences\n"
+            "  * Include at least one Slack emoji (for example :tada:)\n"
+            "- Set next_step = IDLE\n"
+            "- Clear active_release in state_patch/next_state\n"
+            "- Set flow_lifecycle='completed'\n"
+            "- Otherwise keep WAIT_RC_READINESS with flow_lifecycle='paused'\n\n"
             "## Output Format\n\n"
             "Return compact valid JSON matching AgentDecision schema. Example:\n\n"
             '{\n'
@@ -194,7 +232,7 @@ def build_flow_task(agent: dict[str, object]) -> dict[str, object]:
             "- Include all required tool fields in args\n"
             "- Never use 'functions.' prefix in tool names\n"
             "- flow_lifecycle='paused' requires flow_execution_id to be set\n"
-            "- After approval_confirmed, always send slack_update to mark the approval message\n"
+            "- After approval_confirmed or approval_rejected, send slack_update for the clicked message\n"
             "- If you are uncertain, return conservative no-op (same step/state, empty tool_calls) with explicit audit_reason"
         ),
     }

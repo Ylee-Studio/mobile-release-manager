@@ -155,11 +155,11 @@ def test_wait_readiness_state_follows_agent_decision_payload(tmp_path: Path) -> 
     assert state.active_release.readiness_map == {"Growth": True, "Core": False}
 
 
-def test_wait_readiness_transition_to_wait_branch_cut_is_agent_driven(tmp_path: Path) -> None:
+def test_wait_readiness_transition_to_wait_branch_cut_approval_is_agent_driven(tmp_path: Path) -> None:
     decision_state = WorkflowState(
         active_release=ReleaseContext(
             release_version="5.104.0",
-            step=ReleaseStep.WAIT_BRANCH_CUT,
+            step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
             slack_channel_id="C_RELEASE",
             message_ts={"generic_message": "177.700"},
             thread_ts={"generic_message": "177.700"},
@@ -172,11 +172,11 @@ def test_wait_readiness_transition_to_wait_branch_cut_is_agent_driven(tmp_path: 
     runtime = _RecordingRuntime(
         decisions=[
             RuntimeDecision(
-                next_step=ReleaseStep.WAIT_BRANCH_CUT,
+                next_step=ReleaseStep.WAIT_BRANCH_CUT_APPROVAL,
                 next_state=decision_state,
                 audit_reason="agent_readiness_complete",
                 actor="flow_agent",
-                flow_lifecycle="completed",
+                flow_lifecycle="paused",
             )
         ]
     )
@@ -186,6 +186,6 @@ def test_wait_readiness_transition_to_wait_branch_cut_is_agent_driven(tmp_path: 
     state = workflow.tick(trigger_reason="signal_trigger")
 
     assert len(runtime.received_events) == 1
-    assert state.step == ReleaseStep.WAIT_BRANCH_CUT
+    assert state.step == ReleaseStep.WAIT_BRANCH_CUT_APPROVAL
     assert state.active_release is not None
     assert state.active_release.readiness_map == {"Growth": True, "Core": True}

@@ -24,7 +24,7 @@ from .slack_ingress import build_ingress_config, run_slack_ingress
 from .tools.github_tools import GitHubGateway
 from .tools.slack_tools import SlackGateway
 
-app = typer.Typer(help="Coordinate release train workflow up to WAIT_BRANCH_CUT_APPROVAL.")
+app = typer.Typer(help="Coordinate release train workflow up to WAIT_RC_READINESS.")
 console = Console()
 
 

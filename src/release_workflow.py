@@ -27,6 +27,13 @@ MANUAL_RELEASE_MESSAGE = (
     "Подтвердите создание релиза {release_version} в JIRA. "
     "<https://instories.atlassian.net/jira/plans/1/scenarios/1/releases|JIRA>"
 )
+RC_BRANCH_APPROVAL_MESSAGE = (
+    "Выделил RC ветку. Подтвердите "
+    "<https://github.com/Ylee-Studio/instories-ios/actions|готовность> ветки.\n"
+    "- FontThumbnailManager.Spec обновлен при необходимости\n"
+    "- В L10n.extension.swift нет временной локализации\n"
+    "- В TestTemplates.swift нет шаблонов"
+)
 
 @dataclass
 class RuntimeConfig:
@@ -121,7 +128,12 @@ class ReleaseWorkflow:
                 tool_calls=[],
             )
         self._execute_tool_calls(decision=decision, events=events)
-        self._poll_branch_cut_action_if_due(decision=decision)
+        self._confirm_manual_override_request(decision=decision, events=events)
+        self._confirm_release_ready_request(
+            previous_state=previous_state,
+            decision=decision,
+            events=events,
+        )
         next_state = decision.next_state
         self.state_store.save(state=next_state, reason=decision.audit_reason)
         self._state = WorkflowState.from_dict(next_state.to_dict())
@@ -248,20 +260,15 @@ class ReleaseWorkflow:
             if tool_name == "slack_update":
                 self._execute_slack_update(call=call, decision=decision, events=events)
             if tool_name == "github_action":
-                self._execute_github_action(call=call, decision=decision)
+                self._execute_github_action(call=call, decision=decision, events=events)
 
     def _execute_github_action(
         self,
         *,
         call: dict[str, Any],
         decision: RuntimeDecision,
+        events: list[Any],
     ) -> None:
-        release = decision.next_state.active_release
-        if release is None:
-            return
-        if release.github_action_run_id:
-            # Prevent duplicate dispatch across repeated ticks.
-            return
         args_raw = call.get("args", {})
         args = args_raw if isinstance(args_raw, dict) else {}
         workflow_file = str(args.get("workflow_file") or self.config.github_workflow_file).strip()
@@ -270,7 +277,31 @@ class ReleaseWorkflow:
         ref = str(args.get("ref") or self.config.github_ref).strip() or "dev"
         inputs_raw = args.get("inputs", {})
         inputs = inputs_raw if isinstance(inputs_raw, dict) else {}
-        if "version" not in inputs:
+
+        release = decision.next_state.active_release
+        if release is None:
+            # Stateless trigger mode: dispatch workflow without touching workflow state.
+            try:
+                self.github_gateway.trigger_workflow(
+                    workflow_file=workflow_file,
+                    ref=ref,
+                    inputs=inputs,
+                )
+            except Exception as exc:  # pragma: no cover - runtime safety
+                self.logger.exception("github_action stateless trigger failed: %s", exc)
+                return
+            if _is_build_rc_workflow(workflow_file):
+                self._add_white_check_mark_for_latest_message(
+                    events=events,
+                    reason="build_rc_dispatched",
+                )
+            return
+
+        is_branch_cut_workflow = workflow_file == self.config.github_workflow_file
+        if is_branch_cut_workflow and release.github_action_run_id:
+            # Prevent duplicate dispatch across repeated ticks.
+            return
+        if is_branch_cut_workflow and "version" not in inputs:
             inputs["version"] = release.release_version
         try:
             run = self.github_gateway.trigger_workflow(
@@ -281,10 +312,62 @@ class ReleaseWorkflow:
         except Exception as exc:  # pragma: no cover - runtime safety
             self.logger.exception("github_action failed for release=%s: %s", release.release_version, exc)
             return
+        if not is_branch_cut_workflow:
+            if _is_build_rc_workflow(workflow_file):
+                self._add_white_check_mark_for_latest_message(
+                    events=events,
+                    reason="build_rc_dispatched",
+                )
+            return
         release.github_action_run_id = run.run_id
         release.github_action_status = run.status
         release.github_action_conclusion = run.conclusion
         release.github_action_last_polled_at = datetime.now(timezone.utc).isoformat()
+
+    def _confirm_manual_override_request(
+        self,
+        *,
+        decision: RuntimeDecision,
+        events: list[Any],
+    ) -> None:
+        if not str(decision.audit_reason or "").startswith("manual_status_override:"):
+            return
+        self._add_white_check_mark_for_latest_message(
+            events=events,
+            reason="manual_status_override",
+        )
+
+    def _add_white_check_mark_for_latest_message(
+        self,
+        *,
+        events: list[Any],
+        reason: str,
+    ) -> None:
+        message_event = _extract_latest_message_event(events)
+        if message_event is None:
+            return
+        channel_id = str(getattr(message_event, "channel_id", "") or "").strip()
+        message_ts = str(getattr(message_event, "message_ts", "") or "").strip()
+        if not channel_id or not message_ts:
+            self.logger.warning(
+                "skip confirmation reaction reason=%s missing channel/message ts",
+                reason,
+            )
+            return
+        try:
+            self.slack_gateway.add_reaction(
+                channel_id=channel_id,
+                message_ts=message_ts,
+                emoji="white_check_mark",
+            )
+        except Exception as exc:  # pragma: no cover - runtime safety
+            self.logger.warning(
+                "failed to add confirmation reaction reason=%s channel=%s ts=%s: %s",
+                reason,
+                channel_id,
+                message_ts,
+                exc,
+            )
 
     def _execute_slack_approve(
         self,
@@ -308,6 +391,10 @@ class ReleaseWorkflow:
                 f"<{release_issues_url}|релиза> уже прошла."
             )
             default_approve_label = "Митинг проведен"
+        elif decision.next_step == ReleaseStep.WAIT_BRANCH_CUT_APPROVAL:
+            message_key = "branch_cut_approval"
+            default_text = RC_BRANCH_APPROVAL_MESSAGE
+            default_approve_label = "Подтвердить"
         else:
             message_key = "start_approval"
             default_text = (
@@ -325,6 +412,9 @@ class ReleaseWorkflow:
         args = args_raw if isinstance(args_raw, dict) else {}
         text = str(args.get("text") or "").strip() or default_text
         approve_label = str(args.get("approve_label") or default_approve_label)
+        reject_label = str(args.get("reject_label") or "").strip() or None
+        if message_key != "start_approval":
+            reject_label = None
 
         decision.next_state.checkpoints.append(
             {
@@ -340,6 +430,7 @@ class ReleaseWorkflow:
                 channel_id=channel_id,
                 text=text,
                 approve_label=approve_label,
+                reject_label=reject_label,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
             self.logger.exception("slack_approve failed for release=%s: %s", release.release_version, exc)
@@ -558,9 +649,12 @@ class ReleaseWorkflow:
             trigger_message_text = ""
             if isinstance(metadata, dict):
                 trigger_message_text = str(metadata.get("trigger_message_text") or "").strip()
+            approval_suffix = "Подтверждено :white_check_mark:"
+            if str(getattr(approval_event, "event_type", "")).strip() == "approval_rejected":
+                approval_suffix = "Отклонено :x:"
             text = _with_approval_suffix(
                 base_text=trigger_message_text or text,
-                suffix="Подтверждено :white_check_mark:",
+                suffix=approval_suffix,
             )
         elif text and not text.endswith(":white_check_mark:") and not _is_readiness_checklist_message(text):
             text = f"{text} :white_check_mark:"
@@ -598,34 +692,28 @@ class ReleaseWorkflow:
             }
         )
 
-    def _poll_branch_cut_action_if_due(self, *, decision: RuntimeDecision) -> None:
-        release = decision.next_state.active_release
-        if release is None:
+    def _confirm_release_ready_request(
+        self,
+        *,
+        previous_state: WorkflowState,
+        decision: RuntimeDecision,
+        events: list[Any],
+    ) -> None:
+        if previous_state.step != ReleaseStep.WAIT_RC_READINESS:
             return
-        if decision.next_state.step != ReleaseStep.WAIT_BRANCH_CUT:
+        if decision.next_step != ReleaseStep.IDLE:
             return
-        run_id = release.github_action_run_id
-        if not run_id:
+        if decision.next_state.active_release is not None:
             return
-        now = datetime.now(timezone.utc)
-        last_polled = _parse_iso_datetime(release.github_action_last_polled_at)
-        if last_polled is not None:
-            elapsed = (now - last_polled).total_seconds()
-            if elapsed < max(1, int(self.config.github_poll_interval_seconds)):
-                return
-        try:
-            run = self.github_gateway.get_workflow_run(run_id=run_id)
-        except Exception as exc:  # pragma: no cover - runtime safety
-            self.logger.warning("github_action poll failed run_id=%s: %s", run_id, exc)
+        message_event = _extract_latest_message_event(events)
+        if message_event is None:
             return
-        release.github_action_status = run.status
-        release.github_action_conclusion = run.conclusion
-        release.github_action_last_polled_at = now.isoformat()
-        if run.status == "completed":
-            release.set_step(ReleaseStep.WAIT_BRANCH_CUT_APPROVAL)
-            decision.next_step = ReleaseStep.WAIT_BRANCH_CUT_APPROVAL
-            decision.flow_lifecycle = "paused"
-            decision.audit_reason = f"github_action_completed:{run.conclusion or 'unknown'}"
+        if not _is_release_ready_message(getattr(message_event, "text", "")):
+            return
+        self._add_white_check_mark_for_latest_message(
+            events=events,
+            reason="release_ready_confirmed",
+        )
 
 
 class _LegacyMemoryStateStore:
@@ -769,9 +857,21 @@ def _extract_event_channel_id(events: list[Any]) -> str:
 
 def _extract_latest_approval_event(events: list[Any]) -> Any | None:
     for event in reversed(events):
-        if str(getattr(event, "event_type", "")).strip() == "approval_confirmed":
+        event_type = str(getattr(event, "event_type", "")).strip()
+        if event_type in {"approval_confirmed", "approval_rejected"}:
             return event
     return None
+
+
+def _extract_latest_message_event(events: list[Any]) -> Any | None:
+    for event in reversed(events):
+        if str(getattr(event, "event_type", "")).strip() == "message":
+            return event
+    return None
+
+
+def _is_build_rc_workflow(workflow_file: str) -> bool:
+    return str(workflow_file or "").strip().lower().endswith("build_rc.yml")
 
 
 def _with_approval_suffix(*, base_text: str, suffix: str) -> str:
@@ -916,9 +1016,11 @@ def _is_readiness_checklist_message(text: str) -> bool:
 
 
 def _must_be_channel_level_message(*, text: str, next_step: ReleaseStep) -> bool:
-    if next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS:
-        return True
-    return str(text or "").strip() == "Можно выделять RC ветку"
+    return next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+
+
+def _is_release_ready_message(text: str) -> bool:
+    return str(text or "").strip() == "Релиз готов к отправке"
 
 
 def _readiness_item_from_audit_reason(audit_reason: str) -> str:
@@ -947,19 +1049,5 @@ def _audit_field(audit_reason: str, key: str) -> str | None:
             continue
         return normalized.split(":", 1)[-1].strip() or None
     return None
-
-
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 

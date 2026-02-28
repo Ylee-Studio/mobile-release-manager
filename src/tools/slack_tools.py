@@ -49,7 +49,33 @@ class SlackGateway:
             raise _runtime_error_from_slack("chat.postMessage", exc) from exc
         return _message_ts_from_response(response=response, method_name="chat.postMessage")
 
-    def send_approve(self, channel_id: str, text: str, approve_label: str) -> dict[str, str]:
+    def send_approve(
+        self,
+        channel_id: str,
+        text: str,
+        approve_label: str,
+        *,
+        reject_label: str | None = None,
+    ) -> dict[str, str]:
+        action_elements: list[dict[str, Any]] = [
+            {
+                "type": "button",
+                "action_id": "release_approve",
+                "text": {"type": "plain_text", "text": approve_label},
+                "style": "primary",
+                "value": approve_label,
+            }
+        ]
+        if reject_label:
+            action_elements.append(
+                {
+                    "type": "button",
+                    "action_id": "release_reject",
+                    "text": {"type": "plain_text", "text": reject_label},
+                    "style": "danger",
+                    "value": reject_label,
+                }
+            )
         try:
             response = self.client.chat_postMessage(
                 channel=channel_id,
@@ -61,15 +87,7 @@ class SlackGateway:
                     },
                     {
                         "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "release_approve",
-                                "text": {"type": "plain_text", "text": approve_label},
-                                "style": "primary",
-                                "value": approve_label,
-                            }
-                        ],
+                        "elements": action_elements,
                     },
                 ],
             )
@@ -224,6 +242,10 @@ class SlackApproveInput(BaseModel):
     channel_id: str = Field(..., min_length=1, description="Target Slack channel id.")
     text: str = Field(..., min_length=1, description="Approval request text.")
     approve_label: str = Field(default="Подтвердить", min_length=1, description="Button label.")
+    reject_label: str | None = Field(
+        default=None,
+        description="Optional reject button label.",
+    )
 
     @field_validator("channel_id", "text", "approve_label")
     @classmethod
@@ -232,6 +254,14 @@ class SlackApproveInput(BaseModel):
         if not stripped:
             raise ValueError("must be non-empty")
         return stripped
+
+    @field_validator("reject_label")
+    @classmethod
+    def _strip_optional_reject_label(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class SlackUpdateInput(BaseModel):

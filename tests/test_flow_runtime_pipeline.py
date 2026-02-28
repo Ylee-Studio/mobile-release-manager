@@ -254,8 +254,15 @@ def test_direct_llm_runtime_logs_usage_tokens(monkeypatch, caplog) -> None:  # n
         def usage(self) -> _Usage:
             return _Usage()
 
-    async def _fake_run_agent_async(self, *, prompt: str, model_name: str, trigger_reason: str) -> _RunResult:  # noqa: ANN001, ARG001
-        return _RunResult()
+    async def _fake_run_agent_async(
+        self,
+        *,
+        prompt: str,
+        model_name: str,
+        trigger_reason: str,
+        **_: object,
+    ) -> tuple[_RunResult, dict[str, int]]:  # noqa: ANN001, ARG001
+        return _RunResult(), {"model_wait_ms": 0, "result_parse_ms": 0}
 
     monkeypatch.setattr(
         DirectLLMRuntime,
@@ -287,8 +294,15 @@ def test_direct_llm_runtime_logs_when_usage_unavailable(monkeypatch, caplog) -> 
         def usage(self) -> None:
             return None
 
-    async def _fake_run_agent_async(self, *, prompt: str, model_name: str, trigger_reason: str) -> _RunResult:  # noqa: ANN001, ARG001
-        return _RunResult()
+    async def _fake_run_agent_async(
+        self,
+        *,
+        prompt: str,
+        model_name: str,
+        trigger_reason: str,
+        **_: object,
+    ) -> tuple[_RunResult, dict[str, int]]:  # noqa: ANN001, ARG001
+        return _RunResult(), {"model_wait_ms": 0, "result_parse_ms": 0}
 
     monkeypatch.setattr(
         DirectLLMRuntime,
@@ -460,6 +474,66 @@ def test_kickoff_routes_non_message_paused_events_to_agent(monkeypatch, tmp_path
     assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
     assert decision.flow_lifecycle == "paused"
     assert decision.audit_reason == "agent_transition_after_approval_event"
+
+
+def test_kickoff_routes_reject_event_and_allows_reset_to_idle(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    gateway = SlackGateway(bot_token="xoxb-test-token", events_path=tmp_path / "events.jsonl")
+    coordinator = RuntimeCoordinator(
+        policy=_policy(),
+        slack_gateway=gateway,
+        memory_db_path=str(tmp_path / "memory.db"),
+    )
+    called = {"value": False}
+
+    def _agent_decision(*, payload: dict[str, object]) -> dict[str, object]:
+        called["value"] = True
+        events = payload.get("events", [])
+        assert isinstance(events, list)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "approval_rejected"
+        return {
+            "next_step": "IDLE",
+            "next_state": {
+                "active_release": None,
+                "checkpoints": [],
+            },
+            "tool_calls": [],
+            "audit_reason": "start_rejected",
+            "flow_lifecycle": "completed",
+        }
+
+    monkeypatch.setattr(coordinator, "_execute_runtime", _agent_decision)
+
+    initial_state = WorkflowState(
+        active_release=ReleaseContext(
+            release_version="5.105.0",
+            step=ReleaseStep.WAIT_START_APPROVAL,
+            slack_channel_id="C_RELEASE",
+        ),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation",
+    )
+    decision = coordinator.kickoff(
+        state=initial_state,
+        events=[
+            SlackEvent(
+                event_id="evt-3",
+                event_type="approval_rejected",
+                channel_id="C_RELEASE",
+                text="reject",
+                message_ts="123.458",
+            )
+        ],
+        config=_config(),
+    )
+
+    assert called["value"] is True
+    assert decision.next_step == ReleaseStep.IDLE
+    assert decision.next_state.active_release is None
+    assert decision.flow_lifecycle == "completed"
+    assert decision.audit_reason == "start_rejected"
 
 
 def test_normalize_readiness_message_adds_mentions_and_keeps_reminder_bold() -> None:

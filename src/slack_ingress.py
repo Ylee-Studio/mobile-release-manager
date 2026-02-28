@@ -129,6 +129,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
             return
 
         action = (payload.get("actions") or [{}])[0]
+        action_id = str(action.get("action_id") or "").strip()
         channel_id = str((payload.get("channel") or {}).get("id", ""))
         message = payload.get("message") or {}
         container = payload.get("container") or {}
@@ -151,16 +152,17 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "ignored": True})
             return
 
+        event_type = "approval_rejected" if action_id == "release_reject" else "approval_confirmed"
         self.writer.write(
             event_id=f"action-{payload.get('trigger_id') or uuid.uuid4()}",
-            event_type="approval_confirmed",
+            event_type=event_type,
             channel_id=channel_id,
             text=text,
             thread_ts=thread_ts,
             message_ts=message_ts,
             metadata={
                 "source": "interactivity",
-                "action_id": action.get("action_id"),
+                "action_id": action_id,
                 "block_id": action.get("block_id"),
                 "user_id": (payload.get("user") or {}).get("id"),
                 "trigger_message_text": trigger_message_text,
