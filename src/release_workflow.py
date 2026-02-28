@@ -127,7 +127,11 @@ class ReleaseWorkflow:
                 actor=decision.actor,
                 tool_calls=[],
             )
-        self._execute_tool_calls(decision=decision, events=events)
+        self._execute_tool_calls(
+            decision=decision,
+            events=events,
+            previous_state=previous_state,
+        )
         self._confirm_manual_override_request(decision=decision, events=events)
         self._confirm_release_ready_request(
             previous_state=previous_state,
@@ -248,7 +252,13 @@ class ReleaseWorkflow:
             incoming_slack_messages,
         )
 
-    def _execute_tool_calls(self, *, decision: RuntimeDecision, events: list[Any]) -> None:
+    def _execute_tool_calls(
+        self,
+        *,
+        decision: RuntimeDecision,
+        events: list[Any],
+        previous_state: WorkflowState,
+    ) -> None:
         for call in decision.tool_calls:
             if not isinstance(call, dict):
                 continue
@@ -256,7 +266,12 @@ class ReleaseWorkflow:
             if tool_name == "slack_approve":
                 self._execute_slack_approve(call=call, decision=decision, events=events)
             if tool_name == "slack_message":
-                self._execute_slack_message(call=call, decision=decision, events=events)
+                self._execute_slack_message(
+                    call=call,
+                    decision=decision,
+                    events=events,
+                    previous_state=previous_state,
+                )
             if tool_name == "slack_update":
                 self._execute_slack_update(call=call, decision=decision, events=events)
             if tool_name == "github_action":
@@ -397,10 +412,7 @@ class ReleaseWorkflow:
             default_approve_label = "Подтвердить"
         else:
             message_key = "start_approval"
-            default_text = (
-                f"Подтвердите старт релизного трейна {release.release_version}. "
-                "Если нужен другой номер для релиза, напишите в треде."
-            )
+            default_text = f"Подтвердите старт релизного трейна {release.release_version}."
             default_approve_label = "Подтвердить"
 
         channel_id = release.slack_channel_id or _extract_event_channel_id(events) or self.config.slack_channel_id
@@ -460,6 +472,7 @@ class ReleaseWorkflow:
         call: dict[str, Any],
         decision: RuntimeDecision,
         events: list[Any],
+        previous_state: WorkflowState | None = None,
     ) -> None:
         release = decision.next_state.active_release
         args_raw = call.get("args", {})
@@ -559,7 +572,14 @@ class ReleaseWorkflow:
             self.logger.warning("skip slack_message: empty channel_id for release=%s", release_version)
             return
 
-        if _must_be_channel_level_message(text=text, next_step=decision.next_step):
+        if _must_be_channel_level_message(text=text, next_step=decision.next_step) or (
+            previous_state is not None
+            and _is_final_release_congratulation(
+                previous_step=previous_state.step,
+                next_step=decision.next_step,
+                events=events,
+            )
+        ):
             # Readiness checklist and RC-branch-ready notice must be top-level channel messages.
             thread_ts_value = None
         else:
@@ -600,7 +620,12 @@ class ReleaseWorkflow:
             and decision.next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
             and message_ts
         ):
-            release.thread_ts[message_key] = thread_ts_value or message_ts
+            checklist_ts = thread_ts_value or message_ts
+            # Readiness replies are validated against the checklist thread key.
+            # Keep both generic and explicit readiness keys aligned with the posted checklist ts.
+            release.thread_ts[message_key] = checklist_ts
+            release.thread_ts["readiness"] = checklist_ts
+            release.message_ts["readiness"] = message_ts
         if release is not None:
             release.slack_channel_id = channel_id
         decision.next_state.checkpoints.append(
@@ -621,8 +646,7 @@ class ReleaseWorkflow:
         events: list[Any],
     ) -> None:
         release = decision.next_state.active_release
-        if release is None:
-            return
+        release_version = release.release_version if release is not None else "n/a"
 
         args_raw = call.get("args", {})
         args = args_raw if isinstance(args_raw, dict) else {}
@@ -630,17 +654,17 @@ class ReleaseWorkflow:
         event_message_ts = str(getattr(approval_event, "message_ts", "") or "").strip() if approval_event else ""
         message_ts = str(args.get("message_ts") or "").strip() or event_message_ts
         if not message_ts:
-            self.logger.warning("skip slack_update: empty message_ts for release=%s", release.release_version)
+            self.logger.warning("skip slack_update: empty message_ts for release=%s", release_version)
             return
 
         channel_id = (
             str(args.get("channel_id") or "").strip()
-            or release.slack_channel_id
+            or (release.slack_channel_id if release is not None else "")
             or _extract_event_channel_id(events)
             or self.config.slack_channel_id
         )
         if not channel_id:
-            self.logger.warning("skip slack_update: empty channel_id for release=%s", release.release_version)
+            self.logger.warning("skip slack_update: empty channel_id for release=%s", release_version)
             return
 
         text = str(args.get("text") or "").strip()
@@ -650,6 +674,8 @@ class ReleaseWorkflow:
             if isinstance(metadata, dict):
                 trigger_message_text = str(metadata.get("trigger_message_text") or "").strip()
             approval_suffix = "Подтверждено :white_check_mark:"
+            if decision.next_step == ReleaseStep.WAIT_RC_READINESS:
+                approval_suffix = f"{approval_suffix}\nя запустил сборку"
             if str(getattr(approval_event, "event_type", "")).strip() == "approval_rejected":
                 approval_suffix = "Отклонено :x:"
             text = _with_approval_suffix(
@@ -659,18 +685,19 @@ class ReleaseWorkflow:
         elif text and not text.endswith(":white_check_mark:") and not _is_readiness_checklist_message(text):
             text = f"{text} :white_check_mark:"
         if not text:
-            self.logger.warning("skip slack_update: empty text for release=%s", release.release_version)
+            self.logger.warning("skip slack_update: empty text for release=%s", release_version)
             return
 
-        decision.next_state.checkpoints.append(
-            {
-                "phase": "before",
-                "tool": "slack_update",
-                "release_version": release.release_version,
-                "step": decision.next_step.value,
-                "at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        if release is not None:
+            decision.next_state.checkpoints.append(
+                {
+                    "phase": "before",
+                    "tool": "slack_update",
+                    "release_version": release.release_version,
+                    "step": decision.next_step.value,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         try:
             self.slack_gateway.update_message(
                 channel_id=channel_id,
@@ -678,19 +705,20 @@ class ReleaseWorkflow:
                 text=text,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
-            self.logger.exception("slack_update failed for release=%s: %s", release.release_version, exc)
+            self.logger.exception("slack_update failed for release=%s: %s", release_version, exc)
             return
 
-        release.slack_channel_id = channel_id
-        decision.next_state.checkpoints.append(
-            {
-                "phase": "after",
-                "tool": "slack_update",
-                "release_version": release.release_version,
-                "step": decision.next_step.value,
-                "at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        if release is not None:
+            release.slack_channel_id = channel_id
+            decision.next_state.checkpoints.append(
+                {
+                    "phase": "after",
+                    "tool": "slack_update",
+                    "release_version": release.release_version,
+                    "step": decision.next_step.value,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
     def _confirm_release_ready_request(
         self,
@@ -710,6 +738,10 @@ class ReleaseWorkflow:
             return
         if not _is_release_ready_message(getattr(message_event, "text", "")):
             return
+        previous_release = previous_state.active_release
+        if previous_release is not None:
+            decision.next_state.previous_release_version = previous_release.release_version
+        decision.next_state.previous_release_completed_at = datetime.now(timezone.utc).isoformat()
         self._add_white_check_mark_for_latest_message(
             events=events,
             reason="release_ready_confirmed",
@@ -1017,6 +1049,22 @@ def _is_readiness_checklist_message(text: str) -> bool:
 
 def _must_be_channel_level_message(*, text: str, next_step: ReleaseStep) -> bool:
     return next_step == ReleaseStep.WAIT_READINESS_CONFIRMATIONS
+
+
+def _is_final_release_congratulation(
+    *,
+    previous_step: ReleaseStep,
+    next_step: ReleaseStep,
+    events: list[Any],
+) -> bool:
+    if previous_step != ReleaseStep.WAIT_RC_READINESS:
+        return False
+    if next_step != ReleaseStep.IDLE:
+        return False
+    latest_message = _extract_latest_message_event(events)
+    if latest_message is None:
+        return False
+    return _is_release_ready_message(getattr(latest_message, "text", ""))
 
 
 def _is_release_ready_message(text: str) -> bool:

@@ -60,6 +60,52 @@ def test_allow_human_message_with_mention_alias_form() -> None:
     assert _should_ignore_message_event(raw_event, message_event) is False
 
 
+def test_handle_events_persists_message_with_mention_without_conversion() -> None:
+    written: list[dict] = []
+    replies: list[tuple[int, dict]] = []
+    triggered = {"called": 0}
+
+    def _write(**kwargs):  # noqa: ANN003
+        written.append(kwargs)
+
+    handler = SimpleNamespace(
+        writer=SimpleNamespace(write=_write),
+        _trigger_event_processing=lambda: triggered.__setitem__("called", triggered["called"] + 1),
+        _send_json=lambda code, payload: replies.append((code, payload)),
+    )
+    raw = {
+        "type": "event_callback",
+        "event_id": "Ev-message-1",
+        "authorizations": [{"user_id": "U_BOT", "is_bot": True}],
+        "event": {
+            "type": "message",
+            "user": "U_HUMAN",
+            "channel": "C_RELEASE",
+            "text": "approve <@U_BOT>",
+            "ts": "171.111",
+        },
+    }
+
+    SlackRequestHandler._handle_events(handler, json.dumps(raw, ensure_ascii=True).encode("utf-8"))  # type: ignore[arg-type]
+
+    assert replies[-1] == (200, {"ok": True})
+    assert triggered["called"] == 1
+    assert written == [
+        {
+            "event_id": "Ev-message-1",
+            "event_type": "message",
+            "channel_id": "C_RELEASE",
+            "text": "approve <@U_BOT>",
+            "thread_ts": "171.111",
+            "message_ts": "171.111",
+            "metadata": {
+                "source": "events_api",
+                "user_id": "U_HUMAN",
+            },
+        }
+    ]
+
+
 def test_interactivity_maps_release_reject_to_approval_rejected() -> None:
     written: list[dict] = []
     replies: list[tuple[int, dict]] = []
@@ -85,7 +131,7 @@ def test_interactivity_maps_release_reject_to_approval_rejected() -> None:
         ],
         "message": {
             "ts": "171.222",
-            "text": "Подтвердите старт релизного трейна 5.105.0",
+            "text": "Подтвердите старт релизного трейна 5.105.0.",
         },
         "container": {},
         "user": {"id": "U123"},

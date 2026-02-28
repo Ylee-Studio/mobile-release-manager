@@ -45,14 +45,14 @@ def build_flow_agent(policies: PolicyConfig) -> dict[str, object]:
             '- Manual message "Переведи X.Y.Z в STATUS" has top priority over normal flow transitions; STATUS can be any ReleaseStep or supported alias, and this path must not create tool_calls\n'
             '- For manual override command parsing, ignore leading Slack mention prefixes (e.g. "<@U...>") and parse the remaining message text\n'
             '- Manual override via message is allowed while lifecycle is paused when message events are provided in the current tick\n'
-            '- IDLE with manual_start event -> create release, move to WAIT_START_APPROVAL, and send exactly one slack_approve with text "Подтвердите старт релизного трейна {version}. Если нужен другой номер для релиза, напишите в треде." and buttons "Подтвердить"/"Отклонить"\n'
+            '- IDLE with manual_start event -> create release, move to WAIT_START_APPROVAL, and send exactly one slack_approve with text "Подтвердите старт релизного трейна {version}." and buttons "Подтвердить"/"Отклонить"\n'
             '- WAIT_START_APPROVAL after approval_confirmed -> send slack_update for approved message and send next slack_approve for Jira release creation\n'
             '- WAIT_START_APPROVAL after approval_rejected -> send slack_update for rejected message, set next_step=IDLE, and clear active_release\n'
             '- WAIT_MANUAL_RELEASE_CONFIRMATION -> after approval, move to WAIT_MEETING_CONFIRMATION\n'
             '- WAIT_MEETING_CONFIRMATION -> after approval, send readiness message and move to WAIT_READINESS_CONFIRMATIONS\n'
             '- WAIT_READINESS_CONFIRMATIONS -> parse thread messages, update readiness_map, update original readiness checklist via slack_update (no per-item ack slack_message), and when all confirmed trigger github_action + send slack_approve for RC readiness + move to WAIT_BRANCH_CUT_APPROVAL\n'
-            '- WAIT_BRANCH_CUT_APPROVAL -> after approval_confirmed mark message via slack_update and move to WAIT_RC_READINESS\n'
-            '- WAIT_RC_READINESS -> when exact message "Релиз готов к отправке" arrives, send exactly one slack_message with a short congratulation (<=2 sentences, includes Slack emoji like :tada:) and then complete flow in IDLE\n\n'
+            '- WAIT_BRANCH_CUT_APPROVAL -> after approval_confirmed mark message via slack_update, trigger github_action for build_rc.yml, and move to WAIT_RC_READINESS\n'
+            '- WAIT_RC_READINESS -> when exact message "Релиз готов к отправке" arrives, send exactly one slack_message with text "Поздравляем — релиз готов к отправке! :tada: Отличная работа всей команде." as a channel-level message (no thread_ts) and then complete flow in IDLE\n\n'
             "Always validate your output against the expected JSON schema before returning."
         ),
     }

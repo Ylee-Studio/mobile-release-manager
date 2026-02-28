@@ -133,7 +133,7 @@ def test_slack_update_uses_trigger_message_text_and_appends_confirmation(tmp_pat
             event_type="approval_confirmed",
             channel_id="C_RELEASE",
             message_ts="111.222",
-            metadata={"trigger_message_text": "Подтвердите старт релизного трейна 5.105.0"},
+            metadata={"trigger_message_text": "Подтвердите старт релизного трейна 5.105.0."},
         )
     ]
 
@@ -143,7 +143,7 @@ def test_slack_update_uses_trigger_message_text_and_appends_confirmation(tmp_pat
         {
             "channel_id": "C_RELEASE",
             "message_ts": "111.222",
-            "text": "Подтвердите старт релизного трейна 5.105.0\n\nПодтверждено :white_check_mark:",
+            "text": "Подтвердите старт релизного трейна 5.105.0.\n\nПодтверждено :white_check_mark:",
         }
     ]
 
@@ -193,7 +193,7 @@ def test_slack_update_marks_rejected_message_with_reject_suffix(tmp_path: Path) 
             event_type="approval_rejected",
             channel_id="C_RELEASE",
             message_ts="111.222",
-            metadata={"trigger_message_text": "Подтвердите старт релизного трейна 5.105.0"},
+            metadata={"trigger_message_text": "Подтвердите старт релизного трейна 5.105.0."},
         )
     ]
 
@@ -203,7 +203,37 @@ def test_slack_update_marks_rejected_message_with_reject_suffix(tmp_path: Path) 
         {
             "channel_id": "C_RELEASE",
             "message_ts": "111.222",
-            "text": "Подтвердите старт релизного трейна 5.105.0\n\nОтклонено :x:",
+            "text": "Подтвердите старт релизного трейна 5.105.0.\n\nОтклонено :x:",
+        }
+    ]
+
+
+def test_slack_update_rejected_works_when_active_release_already_cleared(tmp_path: Path) -> None:
+    workflow, gateway = _build_workflow(tmp_path)
+    decision = RuntimeDecision(
+        next_step=ReleaseStep.IDLE,
+        next_state=WorkflowState(active_release=None),
+        tool_calls=[],
+        audit_reason="start_rejected",
+        flow_lifecycle="completed",
+    )
+    call = {"args": {"channel_id": "C_RELEASE", "message_ts": "111.222", "text": "Отклонено :x:"}}
+    events = [
+        SimpleNamespace(
+            event_type="approval_rejected",
+            channel_id="C_RELEASE",
+            message_ts="111.222",
+            metadata={"trigger_message_text": "Подтвердите старт релизного трейна 5.105.0."},
+        )
+    ]
+
+    workflow._execute_slack_update(call=call, decision=decision, events=events)  # noqa: SLF001
+
+    assert gateway.updated_payloads == [
+        {
+            "channel_id": "C_RELEASE",
+            "message_ts": "111.222",
+            "text": "Подтвердите старт релизного трейна 5.105.0.\n\nОтклонено :x:",
         }
     ]
 
@@ -267,6 +297,48 @@ def test_readiness_confirmation_updates_original_checklist_without_new_message(t
             ),
         }
     ]
+
+
+def test_wait_readiness_post_sets_explicit_readiness_thread_keys(tmp_path: Path) -> None:
+    workflow, gateway = _build_workflow(tmp_path)
+    decision = RuntimeDecision(
+        next_step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+        next_state=WorkflowState(
+            active_release=ReleaseContext(
+                release_version="5.105.0",
+                step=ReleaseStep.WAIT_READINESS_CONFIRMATIONS,
+                slack_channel_id="C_RELEASE",
+                message_ts={"meeting_confirmation": "111.050"},
+                thread_ts={"meeting_confirmation": "111.050"},
+            )
+        ),
+        tool_calls=[],
+        audit_reason="meeting_confirmed",
+        flow_lifecycle="paused",
+    )
+    checklist_text = (
+        "Релиз <https://instories.atlassian.net/issues/?jql=fixVersion=5.105.0|5.105.0>\n\n"
+        "Статус готовности к срезу:\n"
+        ":hourglass_flowing_sand: Growth @owner\n"
+        ":hourglass_flowing_sand: Core @owner-core\n\n"
+        "Напишите в треде по готовности своей части."
+    )
+    call = {"args": {"channel_id": "C_RELEASE", "text": checklist_text}}
+
+    workflow._execute_slack_message(call=call, decision=decision, events=[])  # noqa: SLF001
+
+    release = decision.next_state.active_release
+    assert release is not None
+    assert release.message_ts["generic_message"] == "200.300"
+    assert release.message_ts["readiness"] == "200.300"
+    assert release.thread_ts["generic_message"] == "200.300"
+    assert release.thread_ts["readiness"] == "200.300"
+    assert len(gateway.sent_payloads) == 1
+    sent = gateway.sent_payloads[0]
+    assert sent["channel_id"] == "C_RELEASE"
+    assert sent["thread_ts"] == ""
+    assert "Статус готовности к срезу:" in sent["text"]
+    assert "Напишите в треде по готовности своей части." in sent["text"]
 
 
 def test_readiness_confirmation_sequentially_updates_only_target_lines(tmp_path: Path) -> None:

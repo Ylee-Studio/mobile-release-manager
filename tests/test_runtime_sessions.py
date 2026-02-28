@@ -97,6 +97,108 @@ def test_paused_flow_with_confirmation_event_runs_kickoff(monkeypatch, tmp_path)
     assert decision.flow_lifecycle == "running"
 
 
+def test_message_with_bot_mention_can_confirm_approval_via_flow(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    flow_calls = {"kickoff": 0}
+
+    class _FlowStub:
+        def kickoff(self, *, inputs):  # noqa: ANN001
+            flow_calls["kickoff"] += 1
+            events = inputs["events"]
+            assert len(events) == 1
+            assert events[0]["event_type"] == "message"
+            assert "<@U_BOT>" in events[0]["text"]
+            return RuntimeDecision(
+                next_step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+                next_state=WorkflowState(
+                    active_release=ReleaseContext(
+                        release_version="5.104.0",
+                        step=ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION,
+                    )
+                ),
+                audit_reason="message_approval_intent",
+                flow_lifecycle="running",
+            )
+
+    coordinator.flow = _FlowStub()
+    state = WorkflowState(
+        active_release=ReleaseContext(release_version="5.104.0", step=ReleaseStep.WAIT_START_APPROVAL),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_START_APPROVAL",
+    )
+    decision = coordinator.kickoff(
+        state=state,
+        events=[
+            SlackEvent(
+                event_id="ev-message-1",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="<@U_BOT> подтверждаю",
+                thread_ts="171.100",
+                message_ts="171.101",
+                metadata={"source": "events_api", "user_id": "U123"},
+            )
+        ],
+        config=_config(),
+    )
+
+    assert flow_calls["kickoff"] == 1
+    assert decision.next_step == ReleaseStep.WAIT_MANUAL_RELEASE_CONFIRMATION
+    assert decision.audit_reason == "message_approval_intent"
+
+
+def test_neutral_message_with_bot_mention_can_result_in_noop(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    flow_calls = {"kickoff": 0}
+
+    class _FlowStub:
+        def kickoff(self, *, inputs):  # noqa: ANN001
+            flow_calls["kickoff"] += 1
+            events = inputs["events"]
+            assert len(events) == 1
+            assert events[0]["event_type"] == "message"
+            assert events[0]["text"] == "<@U_BOT> посмотрел"
+            return RuntimeDecision(
+                next_step=ReleaseStep.WAIT_START_APPROVAL,
+                next_state=WorkflowState(
+                    active_release=ReleaseContext(
+                        release_version="5.104.0",
+                        step=ReleaseStep.WAIT_START_APPROVAL,
+                    )
+                ),
+                audit_reason="message_intent_ambiguous_noop",
+                flow_lifecycle="running",
+            )
+
+    coordinator.flow = _FlowStub()
+    state = WorkflowState(
+        active_release=ReleaseContext(release_version="5.104.0", step=ReleaseStep.WAIT_START_APPROVAL),
+        flow_execution_id="flow-1",
+        flow_paused_at="2026-01-01T00:00:00+00:00",
+        pause_reason="awaiting_confirmation:WAIT_START_APPROVAL",
+    )
+    decision = coordinator.kickoff(
+        state=state,
+        events=[
+            SlackEvent(
+                event_id="ev-message-2",
+                event_type="message",
+                channel_id="C_RELEASE",
+                text="<@U_BOT> посмотрел",
+                thread_ts="171.100",
+                message_ts="171.102",
+                metadata={"source": "events_api", "user_id": "U123"},
+            )
+        ],
+        config=_config(),
+    )
+
+    assert flow_calls["kickoff"] == 1
+    assert decision.next_step == ReleaseStep.WAIT_START_APPROVAL
+    assert decision.audit_reason == "message_intent_ambiguous_noop"
+
+
 def test_resume_from_pending_uses_from_pending_flow(monkeypatch, tmp_path) -> None:
     coordinator = _build_coordinator(monkeypatch, tmp_path)
     called = {"from_pending": 0, "resume": 0}
@@ -170,3 +272,75 @@ def test_resolve_tool_calls_prefers_payload_list_over_partial_native(monkeypatch
     )
 
     assert [call["tool"] for call in resolved] == ["slack_update", "slack_approve"]
+
+
+def test_resolve_tool_calls_fallbacks_to_native_when_payload_invalid(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    payload = {
+        "tool_calls": [
+            {
+                "tool": "slack_update",
+                "reason": "invalid payload call",
+                "args": {
+                    "channel_id": "C0AGLKF6KHD",
+                    "message_ts": "1772178090.522069",
+                    # Missing required `text` to reproduce schema mismatch.
+                },
+            }
+        ]
+    }
+    native_tool_calls = [
+        {
+            "tool": "slack_update",
+            "reason": "native fallback",
+            "args": {
+                "channel_id": "C0AGLKF6KHD",
+                "message_ts": "1772178090.522069",
+                "text": "Подтверждено :white_check_mark:",
+            },
+        }
+    ]
+
+    resolved = coordinator._resolve_tool_calls(  # noqa: SLF001 - explicit regression test for internal policy
+        payload=payload,
+        native_tool_calls=native_tool_calls,
+    )
+
+    assert resolved == [
+        {
+            "tool": "slack_update",
+            "reason": "native fallback",
+            "args": {
+                "channel_id": "C0AGLKF6KHD",
+                "message_ts": "1772178090.522069",
+                "text": "Подтверждено :white_check_mark:",
+            },
+        }
+    ]
+
+
+def test_resolve_tool_calls_returns_empty_when_all_sources_invalid(monkeypatch, tmp_path) -> None:
+    coordinator = _build_coordinator(monkeypatch, tmp_path)
+    payload = {
+        "tool_calls": [
+            {
+                "tool": "slack_update",
+                "reason": "invalid payload call",
+                "args": {"channel_id": "C0AGLKF6KHD"},
+            }
+        ]
+    }
+    native_tool_calls = [
+        {
+            "tool": "slack_update",
+            "reason": "invalid native call",
+            "args": {"message_ts": "1772178090.522069"},
+        }
+    ]
+
+    resolved = coordinator._resolve_tool_calls(  # noqa: SLF001 - explicit regression test for internal policy
+        payload=payload,
+        native_tool_calls=native_tool_calls,
+    )
+
+    assert resolved == []

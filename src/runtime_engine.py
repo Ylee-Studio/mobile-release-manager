@@ -20,7 +20,11 @@ from .agents import build_flow_agent
 from .policies import PolicyConfig
 from .runtime_contracts import AgentDecisionPayload, ToolCallPayload
 from .tasks import build_flow_task
-from .tool_calling import extract_native_tool_calls, validate_and_normalize_tool_calls
+from .tool_calling import (
+    ToolCallValidationError,
+    extract_native_tool_calls,
+    validate_and_normalize_tool_calls,
+)
 from .tools.github_tools import GitHubActionInput
 from .tools.slack_tools import SlackApproveInput, SlackEvent, SlackGateway, SlackMessageInput, SlackUpdateInput
 from .workflow_state import (
@@ -305,8 +309,64 @@ class RuntimeCoordinator:
         native_tool_calls: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         payload_tool_calls = payload.get("tool_calls", [])
-        source = payload_tool_calls if payload_tool_calls else native_tool_calls
-        return validate_and_normalize_tool_calls(source, schema_by_tool=self.tool_args_schema)
+        if not isinstance(payload_tool_calls, list):
+            payload_tool_calls = []
+
+        if payload_tool_calls:
+            try:
+                return validate_and_normalize_tool_calls(
+                    payload_tool_calls,
+                    schema_by_tool=self.tool_args_schema,
+                )
+            except ToolCallValidationError as payload_exc:
+                self.logger.warning(
+                    "payload tool_calls validation failed; trying native fallback: %s",
+                    payload_exc,
+                )
+                if native_tool_calls:
+                    try:
+                        return validate_and_normalize_tool_calls(
+                            native_tool_calls,
+                            schema_by_tool=self.tool_args_schema,
+                        )
+                    except ToolCallValidationError as native_exc:
+                        self.logger.warning(
+                            "native tool_calls validation failed after payload failure: %s",
+                            native_exc,
+                        )
+                salvaged = self._salvage_valid_tool_calls(payload_tool_calls)
+                if not salvaged:
+                    salvaged = self._salvage_valid_tool_calls(native_tool_calls)
+                if salvaged:
+                    self.logger.warning(
+                        "using salvaged validated tool_calls count=%s after validation errors",
+                        len(salvaged),
+                    )
+                return salvaged
+
+        try:
+            return validate_and_normalize_tool_calls(
+                native_tool_calls,
+                schema_by_tool=self.tool_args_schema,
+            )
+        except ToolCallValidationError as native_exc:
+            self.logger.warning("native tool_calls validation failed: %s", native_exc)
+            return self._salvage_valid_tool_calls(native_tool_calls)
+
+    def _salvage_valid_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not tool_calls:
+            return []
+        normalized: list[dict[str, Any]] = []
+        for raw_call in tool_calls:
+            try:
+                validated = validate_and_normalize_tool_calls(
+                    [raw_call],
+                    schema_by_tool=self.tool_args_schema,
+                )
+            except ToolCallValidationError:
+                continue
+            normalized.extend(validated)
+        return normalized
 
     def _execute_runtime(self, *, payload: dict[str, Any]) -> Any:
         return self._llm_runtime.decide_payload(payload=payload, task=self._task)
