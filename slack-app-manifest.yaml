@@ -15,10 +15,16 @@ features:
       description: Start release train flow manually
       usage_hint: "[version optional]"
       should_escape: false
+    - command: /release-status
+      url: https://unrepudiative-alena-succinctly.ngrok-free.dev/slack/commands
+      description: Show current release flow status
+      usage_hint: ""
+      should_escape: false
 oauth_config:
   scopes:
     bot:
       - chat:write
+      - reactions:write
       - channels:history
       - groups:history
       - commands

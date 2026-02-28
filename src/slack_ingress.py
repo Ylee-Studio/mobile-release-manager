@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config_loader import resolve_env_value
+from .workflow_state import WorkflowState
 
 
 @dataclass
@@ -64,6 +65,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
     writer: SlackEventWriter
     cfg: SlackIngressConfig
     on_event_persisted: Callable[[], None] | None = None
+    get_workflow_state: Callable[[], WorkflowState] | None = None
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         route = urlparse(self.path).path
@@ -176,7 +178,7 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
         command = form.get("command", [""])[0]
         channel_id = form.get("channel_id", [""])[0]
         text = form.get("text", [""])[0]
-        if command != "/release-start":
+        if command not in {"/release-start", "/release-status"}:
             self._send_json(200, {"ok": True, "ignored": True})
             return
         if not channel_id:
@@ -188,6 +190,27 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
                 {
                     "response_type": "ephemeral",
                     "text": "Эта команда доступна только в релизном канале.",
+                },
+            )
+            return
+
+        if command == "/release-status":
+            state_reader = getattr(type(self), "get_workflow_state", None)
+            if not state_reader:
+                self._send_json(
+                    200,
+                    {
+                        "response_type": "ephemeral",
+                        "text": "Статус сейчас недоступен.",
+                    },
+                )
+                return
+            public_status = self._build_public_status_payload(state_reader())
+            self._send_json(
+                200,
+                {
+                    "response_type": "ephemeral",
+                    "text": json.dumps(public_status, ensure_ascii=True),
                 },
             )
             return
@@ -210,6 +233,14 @@ class SlackRequestHandler(BaseHTTPRequestHandler):
                 "text": "Запрос на старт релиза принят.",
             },
         )
+
+    def _build_public_status_payload(self, state: WorkflowState) -> dict[str, object]:
+        raw = state.to_dict()
+        return {
+            "active_release": raw.get("active_release"),
+            "previous_release_version": raw.get("previous_release_version"),
+            "previous_release_completed_at": raw.get("previous_release_completed_at"),
+        }
 
     def _trigger_event_processing(self) -> None:
         callback = type(self).on_event_persisted
@@ -324,6 +355,7 @@ def run_slack_ingress(
     port: int,
     cfg: SlackIngressConfig,
     on_event_persisted: Callable[[], None] | None = None,
+    get_workflow_state: Callable[[], WorkflowState] | None = None,
 ) -> None:
     writer = SlackEventWriter(events_path=cfg.events_path)
 
@@ -333,6 +365,7 @@ def run_slack_ingress(
     _Handler.writer = writer
     _Handler.cfg = cfg
     _Handler.on_event_persisted = on_event_persisted
+    _Handler.get_workflow_state = get_workflow_state
 
     server = ThreadingHTTPServer((host, port), _Handler)
     server.serve_forever()

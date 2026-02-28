@@ -110,6 +110,9 @@ def run_slack_webhook(
     def _enqueue_event_for_processing() -> None:
         event_queue.put_nowait(None)
 
+    def _get_workflow_state():
+        return workflow.state_store.load()
+
     with CONFIG_PATH.open("r", encoding="utf-8") as handle:
         raw_config = yaml.safe_load(handle)
     config = raw_config if isinstance(raw_config, dict) else {}
@@ -124,6 +127,7 @@ def run_slack_webhook(
             port=port,
             cfg=cfg,
             on_event_persisted=_enqueue_event_for_processing,
+            get_workflow_state=_get_workflow_state,
         )
     finally:
         event_queue.put_nowait(worker_stop_sentinel)
